@@ -53,15 +53,20 @@ gh pr-watcher install          # te pregunta la config y programa la corrida
 gh pr-watcher run --dry-run    # prueba: informa sin actualizar ninguna rama
 ```
 
-`install` pregunta solo lo que tu cuenta hace necesario, y Enter conserva lo que está entre corchetes:
+`install` pregunta solo lo que tu cuenta hace necesario. Las opciones se eligen con las flechas
+(espacio marca, enter sigue) y arrancan en tu config actual:
 
 - **Cuenta:** solo si `gh` tiene más de una cuenta en github.com. Con una, la usa y listo.
-- **Qué PRs vigilar:** solo si pertenecés a alguna org. Lista tus orgs y tus repos personales, y se
-  eligen por número (`1 2`); `*` = todos tus PRs, en cualquier repo.
+- **Qué PRs vigilar:** solo si pertenecés a alguna org. Lista tus orgs, tus repos personales y
+  "todos tus PRs, en cualquier repo".
 - **Sólo algunos repos:** lista los repos donde tenés PRs (abiertos o recientes) dentro de lo que
-  elegiste. Solo aparece si hay más de uno. `*` = todos.
-- **Cada cuántas horas corre**, **si toca los drafts** y **si excluye los PRs con la etiqueta
-  `no-autoupdate`**.
+  elegiste. Solo aparece si hay más de uno.
+- **Cada cuántas horas corre:** de una lista que muestra a qué horas cae cada opción.
+- **Si toca los drafts** y **si excluye los PRs con la etiqueta `no-autoupdate`**.
+- **Confirmación:** con "No" sale sin tocar nada.
+
+En una terminal sin soporte (`TERM=dumb`) las mismas preguntas salen como menús numerados.
+`NO_COLOR=1` apaga los colores.
 
 ¿Lo instala un agente (Claude Code, Codex…)? Pasale [`AGENTS.md`](AGENTS.md): usa
 `gh pr-watcher detect` para leer cuentas, orgs y repos en JSON y después `install` con flags,

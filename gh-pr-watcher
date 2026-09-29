@@ -442,7 +442,7 @@ acquire_lock() {
 cleanup() {
   [ -n "$GH_ERR_FILE" ] && rm -f "$GH_ERR_FILE"
   [ "$HAVE_LOCK" = "1" ] && rm -rf "$LOCK_DIR"
-  return 0
+  ui_restore
 }
 
 # Detección: una línea por resultado. Las usan install (interactivo) y detect (JSON).
@@ -595,45 +595,183 @@ cmd_detect() {
     }'
 }
 
-# ask VAR "pregunta" : muestra el valor actual como default; Enter lo conserva, "-" lo vacía.
-ask() {
-  local var="$1" question="$2" answer
-  printf '%s\n  [%s]: ' "$question" "${!var}" >/dev/tty
-  IFS= read -r answer </dev/tty || answer=""
-  if [ "$answer" = "-" ]; then
-    printf -v "$var" '%s' ""
-  elif [ -n "$answer" ]; then
-    printf -v "$var" '%s' "$answer"
+# Interfaz del instalador. Con una terminal capaz: menús con flechas al estilo de create-vite.
+# Sin ella (TERM=dumb o stty no responde): los menús numerados, que funcionan en cualquier lado.
+FANCY=0
+C_RESET="" C_DIM="" C_CYAN="" C_GREEN="" C_BOLD=""
+S_START="+" S_BAR="|" S_END="+" S_ACTIVE="*" S_DONE="o" S_ON="[x]" S_OFF="[ ]" S_RON="(*)" S_ROFF="( )"
+STTY_SAVED=""
+CURSOR_HIDDEN=0
+
+ui_init() {
+  [ "${TERM:-dumb}" != "dumb" ] || return 0
+  STTY_SAVED=$(stty -g </dev/tty 2>/dev/null) || { STTY_SAVED=""; return 0; }
+  exec 4>/dev/tty || return 0
+  FANCY=1
+  # Sin eco, una tecla apretada mientras gh consulta la red no ensucia el menú: la lee el paso siguiente.
+  stty -echo </dev/tty 2>/dev/null
+  trap 'exit 130' INT
+  if [ -z "${NO_COLOR:-}" ]; then
+    C_RESET=$'\e[0m' C_DIM=$'\e[2m' C_CYAN=$'\e[36m' C_GREEN=$'\e[32m' C_BOLD=$'\e[1m'
   fi
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*)
+      S_START="┌" S_BAR="│" S_END="└" S_ACTIVE="◆" S_DONE="◇" S_ON="◼" S_OFF="◻" S_RON="●" S_ROFF="○" ;;
+  esac
 }
 
-# choose_one VAR "pregunta" opción...: menú numerado; Enter conserva el valor actual de VAR.
-choose_one() {
-  local var="$1" question="$2" i=1 answer current_idx=""
-  shift 2
-  echo "$question" >/dev/tty
-  for item in "$@"; do
-    printf '  %d) %s\n' "$i" "$item" >/dev/tty
-    [ "$item" = "${!var}" ] && current_idx=$i
-    i=$((i + 1))
+# Deja la terminal como estaba aunque el instalador corte por un error o por Ctrl-C.
+ui_restore() {
+  [ "$CURSOR_HIDDEN" = "1" ] && printf '\e[?25h' >/dev/tty 2>/dev/null
+  [ -n "$STTY_SAVED" ] && stty "$STTY_SAVED" </dev/tty 2>/dev/null
+  return 0
+}
+
+# Una terminal que no informa su ancho (o informa 0) se trata como de 80 columnas.
+ui_cols() {
+  local c
+  c=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
+  if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ]; then echo "$c"; else echo 80; fi
+}
+
+# Recorta al ancho de la terminal: una línea que se parte rompe el redibujado del menú.
+ui_fit() {
+  local max=$(($(ui_cols) - 8)) s="$1"
+  [ "${#s}" -le "$max" ] || s="${s:0:max-1}…"
+  printf '%s' "$s"
+}
+
+ui_intro() { printf '%s%s%s  %s%s%s\n%s%s%s\n' "$C_DIM" "$S_START" "$C_RESET" "$C_BOLD" "$1" "$C_RESET" "$C_DIM" "$S_BAR" "$C_RESET" >&4; }
+ui_outro() { printf '%s%s%s  %s\n' "$C_DIM" "$S_END" "$C_RESET" "$1" >&4; }
+ui_line() { printf '%s%s%s  %s\n' "$C_DIM" "$S_BAR" "$C_RESET" "$1" >&4; }
+
+# Paso respondido: la pregunta queda colapsada con su respuesta.
+ui_done() {
+  printf '%s%s%s  %s\n' "$C_GREEN" "$S_DONE" "$C_RESET" "$1" >&4
+  printf '%s%s%s  %s%s%s\n%s%s%s\n' "$C_DIM" "$S_BAR" "$C_RESET" "$C_DIM" "$(ui_fit "$2")" "$C_RESET" "$C_DIM" "$S_BAR" "$C_RESET" >&4
+}
+
+# Una línea de salida del instalador: dentro del marco si lo hay, a stdout si no.
+report() { if [ "$FANCY" = "1" ]; then ui_line "$*"; else echo "$*"; fi; }
+
+# KEY queda en up, down, left, right, enter, space o la tecla tal cual.
+read_key() {
+  local k rest=""
+  if ! IFS= read -rsn1 k </dev/tty; then KEY=enter; return 0; fi
+  case "$k" in
+    $'\e')
+      IFS= read -rsn2 -t 1 rest </dev/tty
+      case "$rest" in
+        '[A'|OA) KEY=up ;; '[B'|OB) KEY=down ;; '[C'|OC) KEY=right ;; '[D'|OD) KEY=left ;; *) KEY=esc ;;
+      esac ;;
+    "") KEY=enter ;;
+    " ") KEY=space ;;
+    k) KEY=up ;;
+    j) KEY=down ;;
+    *) KEY="$k" ;;
+  esac
+}
+
+# Menú con flechas sobre LP_LABELS; one = elige una (LP_CUR), many = marca varias (LP_ON), y en many
+# la última opción es "todos".
+list_prompt() {
+  local mode="$1" question="$2" hint="$3" n=${#LP_LABELS[@]} i drawn=0 mark color
+  printf '\e[?25l' >&4
+  CURSOR_HIDDEN=1
+  while :; do
+    [ "$drawn" -gt 0 ] && printf '\e[%dA\e[J' "$drawn" >&4
+    printf '%s%s%s  %s\n' "$C_CYAN" "$S_ACTIVE" "$C_RESET" "$question" >&4
+    printf '%s%s%s  %s%s%s\n' "$C_CYAN" "$S_BAR" "$C_RESET" "$C_DIM" "$(ui_fit "$hint")" "$C_RESET" >&4
+    for ((i = 0; i < n; i++)); do
+      if [ "$mode" = "one" ]; then
+        if [ "$i" -eq "$LP_CUR" ]; then mark="$S_RON"; else mark="$S_ROFF"; fi
+      else
+        if [ "${LP_ON[i]}" = "1" ]; then mark="$S_ON"; else mark="$S_OFF"; fi
+      fi
+      if [ "$i" -eq "$LP_CUR" ]; then color="$C_CYAN"; else color="$C_DIM"; fi
+      [ "$mode" = "many" ] && [ "${LP_ON[i]}" = "1" ] && [ "$i" -ne "$LP_CUR" ] && color=""
+      printf '%s%s%s  %s%s %s%s\n' "$C_CYAN" "$S_BAR" "$C_RESET" "$color" "$mark" "$(ui_fit "${LP_LABELS[i]}")" "$C_RESET" >&4
+    done
+    printf '%s%s%s\n' "$C_CYAN" "$S_END" "$C_RESET" >&4
+    drawn=$((n + 3))
+    read_key
+    case "$KEY" in
+      up) LP_CUR=$(((LP_CUR - 1 + n) % n)) ;;
+      down) LP_CUR=$(((LP_CUR + 1) % n)) ;;
+      space) if [ "$mode" = "many" ]; then
+               if [ "${LP_ON[LP_CUR]}" = "1" ]; then LP_ON[LP_CUR]=0; else LP_ON[LP_CUR]=1; fi
+               # La última opción ("todos") excluye a las demás.
+               if [ "${LP_ON[LP_CUR]}" = "1" ]; then
+                 for ((i = 0; i < n; i++)); do
+                   if [ "$LP_CUR" -eq $((n - 1)) ] && [ "$i" -ne "$LP_CUR" ]; then LP_ON[i]=0; fi
+                 done
+                 [ "$LP_CUR" -ne $((n - 1)) ] && LP_ON[n - 1]=0
+               fi
+             fi ;;
+      enter) break ;;
+    esac
   done
+  printf '\e[%dA\e[J\e[?25h' "$drawn" >&4
+  CURSOR_HIDDEN=0
+}
+
+# choose_one VAR "pregunta" "valor|texto"...: Enter (o el número vacío) conserva el valor actual de VAR.
+# Sin "|", el valor es el texto.
+choose_one() {
+  local var="$1" question="$2" i=1 answer current_idx="" item values=() labels=()
+  shift 2
+  for item in "$@"; do
+    case "$item" in *"|"*) values+=("${item%%|*}"); labels+=("${item#*|}") ;; *) values+=("$item"); labels+=("$item") ;; esac
+  done
+  for ((i = 0; i < ${#values[@]}; i++)); do [ "${values[i]}" = "${!var}" ] && current_idx=$i; done
+  if [ "$FANCY" = "1" ]; then
+    LP_LABELS=("${labels[@]}")
+    LP_CUR="${current_idx:-0}"
+    list_prompt one "$question" "↑↓ elegir · enter confirmar"
+    printf -v "$var" '%s' "${values[LP_CUR]}"
+    ui_done "$question" "${labels[LP_CUR]}"
+    return 0
+  fi
+  echo "$question" >/dev/tty
+  for ((i = 0; i < ${#labels[@]}; i++)); do printf '  %d) %s\n' $((i + 1)) "${labels[i]}" >/dev/tty; done
   while true; do
-    printf '  Número [%s]: ' "${current_idx:-1}" >/dev/tty
+    printf '  Número [%s]: ' $((${current_idx:-0} + 1)) >/dev/tty
     IFS= read -r answer </dev/tty || answer=""
-    answer="${answer:-${current_idx:-1}}"
-    if [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le $# ]; then
-      printf -v "$var" '%s' "${!answer}"
+    answer="${answer:-$((${current_idx:-0} + 1))}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le ${#values[@]} ]; then
+      printf -v "$var" '%s' "${values[answer - 1]}"
       return 0
     fi
     echo "  Elegí un número de la lista." >/dev/tty
   done
 }
 
-# choose_many VAR "pregunta" "texto de todos" opción...: números separados por espacio.
-# Enter conserva la selección actual; "*" deja VAR vacío, que para quien llama significa "todos".
+# choose_many VAR "pregunta" "texto de todos" "valor|sufijo"...: varios valores separados por espacio.
+# La opción "todos" (o "*" en los menús numerados) o nada marcado deja VAR vacío, que para quien llama
+# significa "todos".
 choose_many() {
   local var="$1" question="$2" all_text="$3" i=1 answer current="" item n picked ok
   shift 3
+  if [ "$FANCY" = "1" ]; then
+    LP_LABELS=() LP_ON=()
+    for item in "$@"; do
+      LP_LABELS+=("${item%%|*}${item#*|}")
+      case " ${!var} " in *" ${item%%|*} "*) LP_ON+=(1) ;; *) LP_ON+=(0) ;; esac
+    done
+    LP_LABELS+=("$all_text")
+    if [ -z "${!var}" ]; then LP_ON+=(1); else LP_ON+=(0); fi
+    LP_CUR=0
+    list_prompt many "$question" "↑↓ moverse · espacio marcar · enter seguir"
+    picked=""
+    i=0
+    for item in "$@"; do
+      [ "${LP_ON[i]}" = "1" ] && picked="${picked:+$picked }${item%%|*}"
+      i=$((i + 1))
+    done
+    printf -v "$var" '%s' "$picked"
+    if [ -n "$picked" ]; then ui_done "$question" "${picked// /, }"; else ui_done "$question" "$all_text"; fi
+    return 0
+  fi
   echo "$question" >/dev/tty
   for item in "$@"; do
     printf '  %d) %s\n' "$i" "${item%%|*}${item#*|}" >/dev/tty
@@ -658,17 +796,69 @@ choose_many() {
   done
 }
 
+# ask_bool VAR "pregunta": Sí/No con flechas o con s/n; en los menús numerados, s/n escrito.
 ask_bool() {
-  local var="$1" question="$2" current="${!1}"
+  local var="$1" question="$2" answer yes=0 drawn=0
+  [ "${!var}" = "true" ] && yes=1
+  if [ "$FANCY" = "1" ]; then
+    printf '\e[?25l' >&4
+    CURSOR_HIDDEN=1
+    while :; do
+      [ "$drawn" -gt 0 ] && printf '\e[%dA\e[J' "$drawn" >&4
+      printf '%s%s%s  %s\n' "$C_CYAN" "$S_ACTIVE" "$C_RESET" "$question" >&4
+      if [ "$yes" = "1" ]; then
+        printf '%s%s%s  %s%s Sí%s %s/ %s No%s\n' "$C_CYAN" "$S_BAR" "$C_RESET" "$C_CYAN" "$S_RON" "$C_RESET" "$C_DIM" "$S_ROFF" "$C_RESET" >&4
+      else
+        printf '%s%s%s  %s%s Sí /%s %s%s No%s\n' "$C_CYAN" "$S_BAR" "$C_RESET" "$C_DIM" "$S_ROFF" "$C_RESET" "$C_CYAN" "$S_RON" "$C_RESET" >&4
+      fi
+      printf '%s%s%s\n' "$C_CYAN" "$S_END" "$C_RESET" >&4
+      drawn=3
+      read_key
+      case "$KEY" in
+        left|right|up|down|space) yes=$((1 - yes)) ;;
+        s|S|y|Y) yes=1; break ;;
+        n|N) yes=0; break ;;
+        enter) break ;;
+      esac
+    done
+    printf '\e[%dA\e[J\e[?25h' "$drawn" >&4
+    CURSOR_HIDDEN=0
+    if [ "$yes" = "1" ]; then printf -v "$var" true; ui_done "$question" "Sí"; else printf -v "$var" false; ui_done "$question" "No"; fi
+    return 0
+  fi
   while true; do
-    ask "$var" "$question (true/false)"
-    case "${!var}" in
-      true|false) return 0 ;;
-      y|yes|s|si|sí) printf -v "$var" true; return 0 ;;
-      n|no) printf -v "$var" false; return 0 ;;
-      *) printf -v "$var" '%s' "$current"; echo "  Respondé true o false." >/dev/tty ;;
+    printf '%s (s/n)\n  [%s]: ' "$question" "$([ "$yes" = "1" ] && echo s || echo n)" >/dev/tty
+    IFS= read -r answer </dev/tty || answer=""
+    case "$answer" in
+      "") break ;;
+      s|S|si|sí|y|yes|true) yes=1; break ;;
+      n|N|no|false) yes=0; break ;;
+      *) echo "  Respondé s o n." >/dev/tty ;;
     esac
   done
+  if [ "$yes" = "1" ]; then printf -v "$var" true; else printf -v "$var" false; fi
+}
+
+# "0, 6, 12 y 18" a partir de "0 6 12 18".
+join_hours() {
+  local list="$1" out="" h last=""
+  for h in $list; do
+    [ -n "$last" ] && out="${out:+$out, }$last"
+    last=$h
+  done
+  if [ -n "$out" ]; then echo "$out y $last"; else echo "$last"; fi
+}
+
+# Texto de cada opción de frecuencia: con pocas vueltas, las horas; con muchas, cuántas por día.
+hours_label() {
+  local every="$1" h=0 hours="" count=0
+  while [ "$h" -lt 24 ]; do hours="${hours:+$hours }$h"; h=$((h + every)); count=$((count + 1)); done
+  case "$every" in
+    1) echo "cada hora · 24 vueltas por día" ;;
+    24) echo "una vez por día · a las 0 hs" ;;
+    *) if [ "$count" -le 6 ]; then echo "cada $every hs · a las $(join_hours "$hours") hs"
+       else echo "cada $every hs · $count vueltas por día"; fi ;;
+  esac
 }
 
 # Horas de corrida: desde las 0 hs, cada EVERY_HOURS.
@@ -783,8 +973,13 @@ cmd_install() {
     require_session
     use_account
   else
-    echo "Configuración de $NAME. Enter conserva el valor entre corchetes." >/dev/tty
-    echo >/dev/tty
+    ui_init
+    if [ "$FANCY" = "1" ]; then
+      ui_intro "$NAME"
+    else
+      echo "Configuración de $NAME. Enter conserva el valor entre corchetes." >/dev/tty
+      echo >/dev/tty
+    fi
 
     # Cuenta: sólo se pregunta si gh tiene más de una en github.com.
     local accounts=() login
@@ -792,7 +987,7 @@ cmd_install() {
     [ ${#accounts[@]} -gt 0 ] || die "gh no tiene sesión en github.com; corré gh auth login"
     if [ ${#accounts[@]} -eq 1 ]; then
       GH_USER="${accounts[0]}"
-      echo "Cuenta: $GH_USER" >/dev/tty
+      if [ "$FANCY" = "1" ]; then ui_done "Cuenta" "$GH_USER"; else echo "Cuenta: $GH_USER" >/dev/tty; fi
     else
       [ -n "$GH_USER" ] || GH_USER=$(active_account)
       choose_one GH_USER "¿Con qué cuenta de GitHub?" "${accounts[@]}"
@@ -806,7 +1001,11 @@ cmd_install() {
     while IFS= read -r org; do [ -n "$org" ] && orgs+=("$org"); done <<<"$orgs_out"
     if [ ${#orgs[@]} -eq 0 ]; then
       OWNERS=""
-      echo "Orgs: no pertenecés a ninguna, se vigilan todos tus PRs." >/dev/tty
+      if [ "$FANCY" = "1" ]; then
+        ui_done "Orgs" "no pertenecés a ninguna, se vigilan todos tus PRs"
+      else
+        echo "Orgs: no pertenecés a ninguna, se vigilan todos tus PRs." >/dev/tty
+      fi
     else
       [ "$had_config" = "1" ] || OWNERS="${orgs[*]}"
       local owner_items=()
@@ -830,32 +1029,41 @@ cmd_install() {
       for repo in "${repos[@]}"; do repo_items+=("$repo|"); done
       choose_many REPOS "¿Sólo algunos repos? (los que tienen PRs tuyos)" "todos los repos de lo elegido" "${repo_items[@]}"
     fi
-    echo >/dev/tty
+    [ "$FANCY" = "1" ] || echo >/dev/tty
 
-    local prev_hours="$EVERY_HOURS"
-    while :; do
-      ask EVERY_HOURS "¿Cada cuántas horas corre? (1-24, contando desde las 0 hs)"
-      valid_hours "$EVERY_HOURS" && break
-      echo "  Tiene que ser un número de 1 a 24." >/dev/tty
-      EVERY_HOURS="$prev_hours"
-    done
+    # Frecuencia: una lista de las que reparten parejo el día, más la actual si la config trae otra.
+    local hour_items=() h
+    for h in 1 2 3 4 6 8 12 24; do hour_items+=("$h|$(hours_label "$h")"); done
+    case " 1 2 3 4 6 8 12 24 " in
+      *" $EVERY_HOURS "*) ;;
+      *) valid_hours "$EVERY_HOURS" && hour_items+=("$EVERY_HOURS|$(hours_label "$EVERY_HOURS")") ;;
+    esac
+    valid_hours "$EVERY_HOURS" || EVERY_HOURS=6
+    choose_one EVERY_HOURS "¿Cada cuántas horas?" "${hour_items[@]}"
     ask_bool INCLUDE_DRAFTS "¿Actualizar también los drafts?"
     local use_skip_label=false
     [ -n "$SKIP_LABEL" ] && use_skip_label=true
     ask_bool use_skip_label "¿Excluir los PRs con la etiqueta ${SKIP_LABEL:-no-autoupdate}?"
     if [ "$use_skip_label" = "true" ]; then SKIP_LABEL="${SKIP_LABEL:-no-autoupdate}"; else SKIP_LABEL=""; fi
-    echo >/dev/tty
+    local go=true
+    ask_bool go "¿Instalar con esta config?"
+    if [ "$go" != "true" ]; then
+      if [ "$FANCY" = "1" ]; then ui_outro "Cancelado, no se tocó nada."; else echo "Cancelado, no se tocó nada." >/dev/tty; fi
+      return 0
+    fi
+    [ "$FANCY" = "1" ] || echo >/dev/tty
   fi
   validate_config
   check_targets
 
   if [ "$dry_run" = "1" ]; then
+    [ "$FANCY" = "1" ] && ui_outro "dry-run: no se escribió nada, esto es lo que quedaría"
     echo "# (dry-run) config que se escribiría en $CONFIG"
     local k
     for k in $CONFIG_KEYS; do echo "$k=${!k}"; done
   else
     write_config
-    echo "Config guardada en $CONFIG"
+    report "Config guardada en $CONFIG"
   fi
 
   local gh_bin
@@ -865,7 +1073,13 @@ cmd_install() {
     Darwin)
       local others
       others=$(other_agents)
-      [ -n "$others" ] && echo "Aviso: hay otro LaunchAgent que actualiza PRs cargado ($others); los dos van a actualizar y avisar." >&2
+      if [ -n "$others" ]; then
+        if [ "$FANCY" = "1" ] && [ "$dry_run" = "0" ]; then
+          report "Aviso: hay otro LaunchAgent que actualiza PRs cargado ($others); los dos van a actualizar y avisar."
+        else
+          echo "Aviso: hay otro LaunchAgent que actualiza PRs cargado ($others); los dos van a actualizar y avisar." >&2
+        fi
+      fi
       if [ "$dry_run" = "1" ]; then
         echo
         echo "# (dry-run) LaunchAgent que se escribiría en $PLIST"
@@ -876,12 +1090,17 @@ cmd_install() {
       plist_xml "$gh_bin" "$(schedule_path)" >"$PLIST"
       launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
       launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap falló"
-      echo "Programado cada $EVERY_HOURS horas: $(schedule_hours) hs (launchd, $LABEL)."
+      report "Programado $(hours_label "$EVERY_HOURS") (launchd, $LABEL)."
       command -v terminal-notifier >/dev/null \
-        || echo "Aviso: sin terminal-notifier las notificaciones no abren el PR al hacer click (brew install terminal-notifier)."
-      echo "Probalo sin tocar nada: gh pr-watcher run --dry-run"
+        || report "Aviso: sin terminal-notifier las notificaciones no abren el PR al hacer click (brew install terminal-notifier)."
+      if [ "$FANCY" = "1" ]; then
+        ui_outro "Probalo sin tocar nada: gh pr-watcher run --dry-run"
+      else
+        echo "Probalo sin tocar nada: gh pr-watcher run --dry-run"
+      fi
       ;;
     *)
+      [ "$FANCY" = "1" ] && [ "$dry_run" = "0" ] && ui_outro "Falta programarlo a mano:"
       local hours_csv
       hours_csv=$(schedule_hours | tr ' ' ',')
       echo
@@ -1170,6 +1389,22 @@ cmd_doctor() {
   [ "$ok" = "true" ]
 }
 
+# Un typo de una letra (rub, stauts) o un prefijo (inst) sugiere el comando real.
+suggest_command() {
+  local typed="$1" c i diff
+  for c in run install uninstall status detect doctor config log test-notify version help; do
+    if [[ "$c" == "$typed"* ]] && [ ${#typed} -ge 2 ]; then printf ' (¿quisiste decir %s?)' "$c"; return 0; fi
+    [ ${#c} -eq ${#typed} ] || continue
+    diff=0
+    for ((i = 0; i < ${#c}; i++)); do [ "${c:i:1}" = "${typed:i:1}" ] || diff=$((diff + 1)); done
+    if [ "$diff" -le 1 ]; then printf ' (¿quisiste decir %s?)' "$c"; return 0; fi
+    # Dos letras vecinas invertidas.
+    for ((i = 0; i < ${#c} - 1; i++)); do
+      if [ "${typed:0:i}${typed:i+1:1}${typed:i:1}${typed:i+2}" = "$c" ]; then printf ' (¿quisiste decir %s?)' "$c"; return 0; fi
+    done
+  done
+}
+
 main() {
   GH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/$NAME.XXXXXX")
   trap cleanup EXIT
@@ -1187,7 +1422,7 @@ main() {
     doctor) cmd_doctor "$@" ;;
     version|--version|-v) echo "$NAME $VERSION" ;;
     help|--help|-h) usage ;;
-    *) die "comando desconocido: $cmd (gh pr-watcher help lista los comandos)" ;;
+    *) die "comando desconocido: $cmd$(suggest_command "$cmd") (gh pr-watcher help lista los comandos)" ;;
   esac
 }
 
