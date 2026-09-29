@@ -1,27 +1,68 @@
-# Instalar gh-pr-watcher desde un agente
+# Installing gh-pr-watcher from an agent
 
-Guía para un agente de código (Claude Code, Codex, Cursor…) que instala o reconfigura la
-extensión por pedido de una persona. El agente no tiene terminal interactiva: todo va por
-`detect` (lectura, JSON) e `install` con flags (escritura). Sin flags ni terminal, `install` no
-pregunta: usa la config existente más los defaults.
+A guide for a coding agent (Claude Code, Codex, Cursor…) that installs or reconfigures the
+extension on a person's behalf. The agent has no interactive terminal: everything goes through
+`detect` (read, JSON) and `install` with flags (write). With no flags and no terminal, `install`
+asks nothing: it uses the existing config plus the defaults.
 
-## 1. Chequear dependencias
+## What it does (so you can explain it)
+
+Each run searches the person's open PRs (`gh search prs --author @me`) in the configured orgs or
+repos and, for each one:
+
+| PR state | Action |
+|---|---|
+| Draft | Nothing (unless `INCLUDE_DRAFTS=true`). |
+| Has the `SKIP_LABEL` label | Nothing. |
+| Mergeable and behind its base | `PUT /repos/{repo}/pulls/{n}/update-branch`: merges the base into the branch, which triggers CI. |
+| Mergeable and up to date | Nothing. |
+| Conflicting | Notification (clicking it opens the PR), **once**, when the PR becomes conflicting. |
+| GitHub still computing mergeability | Retries for a few seconds; otherwise it waits for the next run. |
+
+- **It does not resolve conflicts.** If GitHub's three-way merge applies cleanly, it updates the
+  branch; if a single line clashes, it only notifies. When the PR becomes mergeable again there is
+  no notification; if it is behind, it gets updated like any other.
+- It never forces anything, never rebases and never pushes from the machine. It sends
+  `expected_head_sha`: if the person pushed between the read and the update, GitHub rejects it and
+  the PR waits for the next run.
+- **Merge, not rebase.** With squash merges it leaves no trace; in repos that require linear
+  history, those merge commits get in the way.
+- **The person's `git push` may bounce** if the watcher updated a branch they have checked out:
+  `git pull` fixes it.
+- **Every update triggers CI.** With "require branches to be up to date", each merge to the base
+  can mean one extra CI run per ready PR per person using it. The cap is the number of runs per
+  day (`EVERY_HOURS`).
+- `gh` reads its token from the keychain, which works under launchd.
+
+There are only two notifications, and they are not configurable:
+
+- **Conflict:** `<repo>#<n> · conflict needs attention`. Clicking it opens the PR.
+- **Stopped working:** `stopped working · gh pr-watcher doctor`, with the error as the body (expired
+  `gh` session, invalid config, an owner that doesn't exist). Clicking it opens the log. It isn't
+  repeated while the error stays the same. Without network it notifies nothing: it logs it and
+  tries again next run.
+
+## 1. Check dependencies
 
 ```bash
-command -v gh && gh auth status        # sin sesión: la persona corre `gh auth login` (interactivo)
-command -v jq                          # si falta: brew install jq
+command -v gh && gh auth status        # no session: the person runs `gh auth login` (interactive)
+command -v jq                          # if missing: brew install jq
 gh extension list | grep pr-watcher || gh extension install ezeed/gh-pr-watcher
 ```
 
-`gh auth login` y `brew install` cambian la máquina: pedí permiso antes de correrlos.
+`jq` is required: it parses `gh`'s output, keeps the state file and builds the JSON of `detect` and
+`doctor --json`. `terminal-notifier` is optional (clickable notifications with an image); without
+it, notifications go through `osascript` with no click.
 
-## 2. Leer el estado
+`gh auth login` and `brew install` change the machine: ask for permission before running them.
+
+## 2. Read the current state
 
 ```bash
-gh pr-watcher detect            # o: detect --user LOGIN, para ver orgs y repos de otra cuenta
+gh pr-watcher detect            # or: detect --user LOGIN, to see another account's orgs and repos
 ```
 
-Devuelve un JSON como este:
+It returns JSON like this:
 
 ```json
 {
@@ -41,81 +82,81 @@ Devuelve un JSON como este:
 }
 ```
 
-- `repos_with_prs` son los repos con PRs de la cuenta, abiertos o entre los 100 más recientes.
-  Son los candidatos a vigilar.
-- `config.values` es lo que hay en el archivo. Si `exists` es false, son los defaults.
-- Si `installed.agent_loaded` es true, ya está instalado: `install` lo reprograma sin duplicarlo.
-- `errors` no vacío significa que algo de lo anterior no se pudo leer (sin `gh`, sin sesión, sin
-  red). Un `orgs` vacío con errores **no** quiere decir "sin orgs": resolvé el error antes de decidir.
-- `last_run_error` es el motivo por el que falló la última vuelta programada, si falló.
-- `other_watcher_agents` lista otros LaunchAgents con "pr-watcher" o "babysitter" en el nombre (por ejemplo, un
-  script casero anterior). Si hay alguno, avisá: los dos correrían a la vez.
+- `repos_with_prs` are the repos where the account has PRs, open or among its 100 most recent.
+  They are the candidates to watch.
+- `config.values` is what the file holds. If `exists` is false, these are the defaults.
+- If `installed.agent_loaded` is true, it's already installed: `install` reschedules it without
+  duplicating it.
+- A non-empty `errors` means something above couldn't be read (no `gh`, no session, no network).
+  An empty `orgs` with errors does **not** mean "no orgs": fix the error before deciding.
+- `last_run_error` is why the last scheduled run failed, if it did.
+- `other_watcher_agents` lists other LaunchAgents with "pr-watcher" or "babysitter" in their name
+  (for example, an earlier home-made script). If there is one, say so: both would run at once.
 
-## 3. Decidir o preguntar
+## 3. Decide or ask
 
-Decidí vos, sin preguntar, lo que sale de `detect`:
+Decide on your own, without asking, whatever `detect` settles:
 
-| Situación | Decisión |
+| Situation | Decision |
 |---|---|
-| Una sola cuenta en `accounts` | No pases `--user`. |
-| Ninguna org en `orgs` | No pases `--owners`: vigila todos los PRs de la cuenta. |
-| `repos_with_prs` cae entero dentro de una sola org | `--owners <org>`. |
-| La persona no mencionó frecuencia, drafts ni etiqueta | Los defaults: cada 6 hs, sin drafts, sin etiqueta. |
+| A single account in `accounts` | Don't pass `--user`. |
+| No orgs in `orgs` | Don't pass `--owners`: it watches all the account's PRs. |
+| `repos_with_prs` falls entirely within one org | `--owners <org>`. |
+| The person didn't mention frequency, drafts or label | The defaults: every 6 h, no drafts, no label. |
 
-Preguntale a la persona, en una sola pregunta y con las opciones de `detect` a la vista:
+Ask the person, in a single question with the options from `detect` in view:
 
-- **Qué cuenta**, si hay más de una en `accounts`.
-- **Qué vigilar**, si tiene orgs o repos repartidos en varios owners. Mostrá `orgs`,
-  `repos_with_prs` y la opción de sus repos personales.
-- **Si reemplaza a un watcher previo**, cuando `other_watcher_agents` no está vacío.
-  Nunca lo descargues sin su OK.
-- **Si le sirve con el costo de CI**, cuando va a vigilar repos compartidos. Cada actualización
-  dispara CI: con "require up to date", cada merge a la base suma una corrida por cada PR suyo.
+- **Which account**, if `accounts` has more than one.
+- **What to watch**, if they have orgs or repos spread across several owners. Show `orgs`,
+  `repos_with_prs` and the option of their personal repos.
+- **Whether it replaces a previous watcher**, when `other_watcher_agents` isn't empty. Never unload
+  it without their OK.
+- **Whether the CI cost is fine**, when it will watch shared repos (see "What it does").
 
-No preguntes por las notificaciones: el aviso de conflicto siempre está y no se configura.
+Don't ask about notifications: the conflict notification is always on and not configurable.
 
-## 4. Instalar
+## 4. Install
 
-Primero mostrá qué va a escribir, después instalá:
+First show what it will write, then install:
 
 ```bash
 gh pr-watcher install --dry-run --owners "AcmeCorp" --every-hours 6 --no-drafts --no-skip-label
 gh pr-watcher install           --owners "AcmeCorp" --every-hours 6 --no-drafts --no-skip-label
 ```
 
-| Flag | Clave | Valor |
+| Flag | Key | Value |
 |---|---|---|
-| `--user LOGIN` | `GH_USER` | Una de `accounts[].login`. Vacío = la activa en cada corrida. |
-| `--owners "A B"` | `OWNERS` | Orgs o usuarios, separados por espacio. `""` = todos los PRs. |
-| `--repos "o/r o/r"` | `REPOS` | Sólo esos repos. **Reemplaza** a `OWNERS` (la búsqueda de GitHub combina org y repo con Y). |
-| `--every-hours N` | `EVERY_HOURS` | 1 a 24, contando desde las 0 hs. |
+| `--user LOGIN` | `GH_USER` | One of `accounts[].login`. Empty = the active account on each run. |
+| `--owners "A B"` | `OWNERS` | Orgs or users, space-separated. `""` = all PRs. |
+| `--repos "o/r o/r"` | `REPOS` | Only those repos. **Replaces** `OWNERS` (GitHub search combines org and repo with AND). |
+| `--every-hours N` | `EVERY_HOURS` | 1 to 24, counting from 0:00. |
 | `--drafts` / `--no-drafts` | `INCLUDE_DRAFTS` | |
-| `--skip-label L` / `--no-skip-label` | `SKIP_LABEL` | La convención es `no-autoupdate`. |
-| `--notify-image PATH` | `NOTIFY_IMAGE` | Imagen adjunta a las notificaciones. `""` = la incluida. |
+| `--skip-label L` / `--no-skip-label` | `SKIP_LABEL` | The convention is `no-autoupdate`. |
+| `--notify-image PATH` | `NOTIFY_IMAGE` | Image attached to notifications. `""` = the bundled one. |
 
-`install` valida antes de escribir nada: el formato de cada valor, que la sesión de `gh` sea válida
-y tenga el permiso `repo`, y que cada owner y repo exista. Si algo falla, no queda nada a medias.
-Los flags que no pases conservan el valor de la config existente. `--yes` fuerza el modo sin
-preguntas aunque haya terminal.
+`install` validates before writing anything: the format of each value, that the `gh` session is
+valid and has the `repo` scope, and that every owner and repo exists. If something fails, nothing
+is left half-done. Flags you don't pass keep the value from the existing config. `--yes` forces the
+no-questions mode even with a terminal.
 
-Instalar es cargar un LaunchAgent en la sesión de la persona: pedí su OK antes de correr el
-`install` sin `--dry-run`.
+Installing loads a LaunchAgent in the person's session: ask for their OK before running `install`
+without `--dry-run`.
 
-## 5. Verificar
+## 5. Verify
 
 ```bash
-gh pr-watcher doctor --json     # ok: true; si no, los checks con status "fail" dicen cómo arreglarlo
-gh pr-watcher run --dry-run     # lista qué PRs actualizaría, sin tocar ninguno
+gh pr-watcher doctor --json     # ok: true; otherwise the "fail" checks say how to fix them
+gh pr-watcher run --dry-run     # lists which PRs it would update, without touching any
 ```
 
-Recién instalado, el check `last_run` dice que todavía no le tocó correr: es lo esperado.
+Right after installing, the `last_run` check says `not due to run yet (next: … h)`: that's expected.
 
-`run --dry-run` no actualiza ramas, no notifica y no guarda estado: se puede correr sin avisar.
-`test-notify` sí manda una notificación (para comprobar que macOS las muestra): pedí permiso.
+`run --dry-run` doesn't update branches, notify or save state: you can run it without asking.
+`test-notify` does send a notification (to check that macOS shows them): ask first.
 
-## Errores
+## Errors
 
-Ante cualquier problema (la persona dice que no anda, o `detect` trae `last_run_error`), empezá por:
+For any problem (the person says it doesn't work, or `detect` has a `last_run_error`), start with:
 
 ```bash
 gh pr-watcher doctor --json
@@ -123,35 +164,36 @@ gh pr-watcher doctor --json
 
 ```json
 {"ok": false, "checks": [
-  {"id": "session", "status": "fail", "message": "al token de 'ana' le falta el permiso repo; corré gh auth refresh -h github.com -s repo", "fix": null},
-  {"id": "last_run", "status": "fail", "message": "tenía que correr a las 2026-09-29 12:00 y no corrió (última: nunca)", "fix": "revisá launchctl print …"}
+  {"id": "session", "status": "fail", "message": "the token for 'ana' is missing the repo scope; run gh auth refresh -h github.com -s repo", "fix": null},
+  {"id": "last_run", "status": "fail", "message": "should have run at 2026-09-29 12:00 and didn't (last: never)", "fix": "check launchctl print gui/<uid>/local.gh-pr-watcher and <state>/launchd.err.log; then gh pr-watcher install --yes"}
 ]}
 ```
 
-`status` es `ok`, `warn` (anda, con una salvedad) o `fail`. El arreglo va en `fix`, o dentro de
-`message` cuando el mensaje ya trae el comando. `doctor` no cambia nada ni notifica: se puede
-correr sin avisar. Aplicar un `fix` sí cambia cosas: pedí permiso como con `install`.
+Check ids: `gh`, `jq`, `config`, `session`, `targets`, `agent`, `last_run`. `status` is `ok`,
+`warn` (works, with a caveat) or `fail`. The fix is in `fix`, or inside `message` when the message
+already carries the command. `doctor` changes nothing and doesn't notify: you can run it without
+asking. Applying a `fix` does change things: ask for permission as with `install`.
 
-Fuera de `doctor`, todo error sale por stderr con el prefijo `error:` y termina con código distinto de 0. Los más
-comunes:
+Outside `doctor`, every error goes to stderr prefixed with `error:` and exits non-zero. The most
+common ones:
 
-| Mensaje | Qué hacer |
+| Message | What to do |
 |---|---|
-| `falta jq` / `falta gh` / `tu gh es muy viejo` | `brew install jq`, `brew install gh` o `brew upgrade gh`, con permiso. |
-| `gh no tiene sesión en github.com` / `gh no tiene sesión como 'X'` | La persona corre `gh auth login`. |
-| `la sesión de gh de 'X' no es válida` / `le falta el permiso repo` | La persona corre el `gh auth refresh …` que indica el mensaje. |
-| `no pude conectar con GitHub` | Sin red o con un proxy: reintentá; no es un problema de config. |
-| `no existe el usuario u org` / `el repo … no existe o tu cuenta no tiene acceso` | Corregí `--owners`/`--repos` con los valores de `detect`. |
-| `… separado por espacios, no por comas` / `REPOS tiene un repo inválido` | Owners y repos van separados por espacio; los repos, `owner/repo`. |
-| `EVERY_HOURS tiene que ser …` | Un entero entre 1 y 24. |
-| `NOTIFY_IMAGE no es un archivo que se pueda leer` | Una ruta local existente, o `--notify-image ""`. |
-| `launchctl bootstrap falló` | Revisá con `plutil -lint` el plist que indica `detect.installed.plist`. |
+| `jq is missing` / `gh, the GitHub CLI, is missing` / `your gh is too old` | `brew install jq`, `brew install gh` or `brew upgrade gh`, with permission. |
+| `gh has no session on github.com` / `gh has no session as 'X'` | The person runs `gh auth login`. |
+| `the gh session for 'X' is not valid` / `the token for 'X' is missing the repo scope` | The person runs the `gh auth refresh …` the message shows. |
+| `could not connect to GitHub` | No network or a proxy: retry; it isn't a config problem. |
+| `user or org 'X' does not exist on GitHub` / `repo 'X' does not exist or your account has no access to it` | Fix `--owners`/`--repos` with the values from `detect`. |
+| `… must be separated by spaces, not commas` / `REPOS has an invalid repo` | Owners and repos are space-separated; repos are `owner/repo`. |
+| `EVERY_HOURS must be a number from 1 to 24` | An integer from 1 to 24. |
+| `NOTIFY_IMAGE is not a readable file` | An existing local path, or `--notify-image ""`. |
+| `launchctl bootstrap failed` | Check the plist at `detect.installed.plist` with `plutil -lint`. |
 
-## Desinstalar
+## Uninstall
 
 ```bash
 gh pr-watcher uninstall && gh extension remove pr-watcher
 ```
 
-La config queda en `config.path` y el log en `~/.local/state/gh-pr-watcher/`. Borrarlos es
-inocuo.
+The config stays at `config.path` and the log in `~/.local/state/gh-pr-watcher/`. Deleting them is
+harmless.

@@ -5,193 +5,148 @@
 <h1 align="center">gh-pr-watcher</h1>
 
 <p align="center">
-  Mantiene al día tus PRs abiertos y te avisa cuando uno entra en conflicto.<br>
-  Una extensión de <a href="https://cli.github.com">GitHub CLI</a> que corre sola unas veces por día.
+  Keeps your open PRs up to date and tells you when one runs into a conflict.<br>
+  A <a href="https://cli.github.com">GitHub CLI</a> extension that runs on its own a few times a day.
 </p>
+
+<p align="center"><b>English</b> · <a href="README.es.md">Español</a></p>
 
 ---
 
-Hace lo mismo que el botón **"Update branch"** de GitHub, pero por vos y en todos tus PRs a la vez.
-No hace falta cambiar nada en el repo: ni Actions, ni bots, ni permisos nuevos.
+It does what GitHub's **"Update branch"** button does, but for you and on all your PRs at once.
+Nothing changes in the repo: no Actions, no bots, no new permissions. It never resolves conflicts,
+rebases or forces anything: when a PR conflicts, it only notifies you.
 
-Pensado para repos con la regla *"Require branches to be up to date before merging"*: cada merge a
-la base deja atrasados a todos los PRs abiertos, y hay que actualizarlos uno por uno antes de mergear.
+Built for repos with the *"Require branches to be up to date before merging"* rule: every merge to
+the base leaves all open PRs behind, and each one has to be updated before it can merge.
 
-## Instalar
+<p align="center">
+  <img src="assets/notification.gif" alt="Conflict notification" width="600">
+</p>
+
+## Install
 
 ```bash
 gh extension install ezeed/gh-pr-watcher
-gh pr-watcher install          # te pregunta la config y programa la corrida
-gh pr-watcher run --dry-run    # prueba: informa qué haría, sin actualizar ninguna rama
+gh pr-watcher install          # asks for the config and schedules the run
+gh pr-watcher run --dry-run    # test: reports what it would do, without updating any branch
 ```
 
-### Requisitos
+### With an agent
 
-- **macOS** para la programación automática (launchd). En Linux, `run` funciona igual e `install`
-  te da la línea para `crontab`.
-- [`gh`](https://cli.github.com) autenticado (`gh auth login`), con permiso de escritura sobre la
-  rama de cada PR. Con tus PRs en el repo de la org ya lo tenés. Desde un fork, el PR necesita
-  *"Allow edits from maintainers"*.
+Ask your coding agent (Claude Code, Codex, Cursor…):
+
+```text
+Install gh-pr-watcher following https://github.com/ezeed/gh-pr-watcher/blob/main/AGENTS.md
+```
+
+It reads your accounts, orgs and repos with `detect` and installs with flags, no console prompts:
+
+```bash
+gh pr-watcher detect
+gh pr-watcher install --owners "AcmeCorp" --every-hours 6
+```
+
+### Requirements
+
+- **macOS** for scheduling (launchd). On Linux, `run` works the same and `install` gives you the
+  `crontab` line.
+- [`gh`](https://cli.github.com) authenticated (`gh auth login`), with write access to each PR's
+  branch. Your PRs in the org's repo already have it. From a fork, the PR needs *"Allow edits from
+  maintainers"*.
 - `jq` (`brew install jq`).
-- Opcional: `terminal-notifier` (`brew install terminal-notifier`), para que el click en la
-  notificación abra el PR. Sin él, las notificaciones salen por `osascript` y sin click.
+- Optional: `terminal-notifier` (`brew install terminal-notifier`), so clicking the notification
+  opens the PR. Without it, notifications go through `osascript` and aren't clickable.
 
-### El instalador
+## Configuration
 
-`install` pregunta solo lo que tu cuenta hace necesario. Se elige con las flechas (espacio marca,
-enter sigue), y si ya lo habías instalado, cada pregunta arranca en tu config actual:
+It lives in `~/.config/gh-pr-watcher/config`: `KEY=VALUE` lines that are read, never executed.
+Changes apply from the next run; only `EVERY_HOURS` needs `gh pr-watcher install --yes` to
+reschedule.
 
-| Pregunta | Cuándo aparece |
-|---|---|
-| **Cuenta** | Si `gh` tiene más de una cuenta en github.com. Con una, la usa y listo. |
-| **¿Qué PRs vigilar?** | Si pertenecés a alguna org. Lista tus orgs, tus repos personales y "todos tus PRs, en cualquier repo". |
-| **¿Sólo algunos repos?** | Si dentro de lo elegido tenés PRs (abiertos o recientes) en más de un repo. |
-| **¿Cada cuántas horas?** | Siempre. Cada opción muestra a qué horas corre. |
-| **Drafts y etiqueta** | Siempre: si actualiza los drafts y si excluye los PRs con la etiqueta `no-autoupdate`. |
-| **¿Instalar con esta config?** | Siempre. Con "No" sale sin tocar nada. |
-
-En una terminal sin soporte (`TERM=dumb`) las mismas preguntas salen como menús numerados, y
-`NO_COLOR=1` apaga los colores.
-
-¿Lo instala un agente (Claude Code, Codex…)? Pasale [`AGENTS.md`](AGENTS.md): usa
-`gh pr-watcher detect` para leer cuentas, orgs y repos en JSON y después `install` con flags, sin
-preguntas por consola.
-
-## Qué hace en cada vuelta
-
-Busca tus PRs abiertos (`gh search prs --author @me`) en las orgs o repos que configuraste y, por
-cada uno:
-
-| Estado del PR | Qué hace |
-|---|---|
-| Draft | Nada (salvo `INCLUDE_DRAFTS=true`). |
-| Tiene la etiqueta `SKIP_LABEL` | Nada. |
-| Mergeable y atrasado respecto de la base | `PUT /repos/{repo}/pulls/{n}/update-branch`: hace merge de la base en la rama, y eso corre CI. |
-| Mergeable y al día | Nada. |
-| En conflicto | Notificación (el click abre el PR). Avisa **una sola vez**, cuando el PR pasa a conflicto. |
-| GitHub todavía calcula si es mergeable | Reintenta unos segundos; si no hay respuesta, queda para la próxima vuelta. |
-
-**No resuelve conflictos.** Si el merge de tres vías de GitHub entra limpio, actualiza la rama. Si
-choca una sola línea, GitHub marca el PR en conflicto y el watcher solo avisa: lo resolvés vos, con
-"Resolve conflicts" en la web o con `git merge` local. Cuando el PR vuelve a ser mergeable no avisa;
-si está atrasado, lo actualiza como a cualquier otro.
-
-Nunca fuerza nada, no hace rebase y no pushea desde tu máquina. Usa `expected_head_sha`: si
-pusheaste algo entre la lectura y la actualización, GitHub rechaza el cambio y el PR queda para la
-próxima vuelta.
-
-### Avisos
-
-Hay solo dos, y no se configuran:
-
-- **Conflicto:** un PR tuyo entró en conflicto. El click abre el PR.
-- **Dejó de andar:** la vuelta entera falló (sesión de `gh` vencida, config inválida, un owner que
-  no existe). Trae el motivo y el click abre el log. No se repite mientras el error sea el mismo.
-
-Sin red no avisa nada: lo anota en el log y sigue en la próxima vuelta. `gh pr-watcher test-notify`
-manda uno de prueba para ver si macOS los deja pasar.
-
-## Configuración
-
-Vive en `~/.config/gh-pr-watcher/config`. Son líneas `KEY=VALUE` que se leen sin ejecutarse. Los
-cambios valen desde la próxima vuelta; solo `EVERY_HOURS` necesita `gh pr-watcher install --yes`
-para reprogramar.
-
-| Clave | Default | Qué controla |
+| Key | Default | What it controls |
 |---|---|---|
-| `GH_USER` | *(vacío)* | Cuenta de `gh` a usar, aunque la activa sea otra. Vacío = la cuenta activa de `gh` en cada corrida. |
-| `OWNERS` | *(vacío)* | Orgs o usuarios cuyos repos se vigilan, separados por espacio. Vacío = todos tus PRs abiertos, en cualquier repo. El instalador propone tus orgs. |
-| `REPOS` | *(vacío)* | Repos puntuales `owner/repo`, separados por espacio. Si hay alguno, se vigilan **solo esos** y `OWNERS` no cuenta (la búsqueda de GitHub combina org y repo con Y, no con O). |
-| `EVERY_HOURS` | `6` | Cada cuántas horas corre (1 a 24), contando desde las 0 hs: `6` = 0, 6, 12 y 18 hs. Si la máquina está dormida a esa hora, launchd corre la vuelta al despertar. |
-| `INCLUDE_DRAFTS` | `false` | `true` = también actualiza los drafts. |
-| `SKIP_LABEL` | *(vacío)* | Los PRs con esta etiqueta no se tocan. El instalador ofrece `no-autoupdate`; en el archivo podés poner cualquiera. |
-| `NOTIFY_IMAGE` | *(el logo)* | Imagen local (PNG o JPG) que va a la derecha de la notificación. Solo con `terminal-notifier`. El ícono de la izquierda no se puede cambiar: macOS lo toma de la app que notifica. |
+| `GH_USER` | *(empty)* | `gh` account to use, even if another one is active. Empty = the active `gh` account on each run. |
+| `OWNERS` | *(empty)* | Orgs or users whose repos are watched, space-separated. Empty = all your open PRs, in any repo. The installer suggests your orgs. |
+| `REPOS` | *(empty)* | Specific `owner/repo` repos, space-separated. If set, **only those** are watched and `OWNERS` is ignored (GitHub search combines org and repo with AND, not OR). |
+| `EVERY_HOURS` | `6` | How often it runs (1 to 24), counting from 0:00: `6` = 0:00, 6:00, 12:00 and 18:00. If the machine is asleep at that time, launchd runs it on wake. |
+| `INCLUDE_DRAFTS` | `false` | `true` = drafts get updated too. |
+| `SKIP_LABEL` | *(empty)* | PRs with this label are left alone. The installer offers `no-autoupdate`; in the file you can use any label. |
+| `NOTIFY_IMAGE` | *(the logo)* | Local image (PNG or JPG) shown on the right of the notification. Only with `terminal-notifier`. The icon on the left can't be changed: macOS takes it from the notifying app. |
 
-Una clave mal escrita (`OWNER=`) o una línea que no es `KEY=VALUE` no se ignora en silencio: se
-avisa, con una sugerencia si se parece a una clave real. `install` además verifica que cada owner
-y cada repo existan y que tu cuenta los vea.
+A misspelled key (`OWNER=`) or a line that isn't `KEY=VALUE` isn't silently ignored: you get a
+warning, with a suggestion if it looks like a real key. `install` also checks that every owner and
+repo exists and that your account can see it.
 
-El log y el estado quedan en `~/.local/state/gh-pr-watcher/`. El estado solo sirve para no repetir
-avisos: borrarlo es inocuo.
+The log and state live in `~/.local/state/gh-pr-watcher/`. The state only prevents repeated
+notifications: deleting it is harmless.
 
-## Comandos
+## Commands
 
-| Comando | Qué hace |
+| Command | What it does |
 |---|---|
-| `install [opciones]` | Guarda la config y programa la corrida (launchd en macOS; en Linux imprime la línea de `crontab`). Sin opciones y con terminal, pregunta. |
-| `run [--dry-run]` | Corre una vuelta ahora. Con `--dry-run` informa qué haría, sin actualizar ramas, sin notificar y sin guardar estado. |
-| `status [--json]` | Config, si el agente está cargado, la última vuelta, el último error y el final del log. |
-| `doctor [--json]` | Revisa todo lo que hace falta para que una vuelta ande y dice cómo arreglar cada problema. No cambia nada. |
-| `log [N]` | Las últimas N líneas del log (30 por default). |
-| `config` | La ruta y el contenido del archivo de config. |
-| `test-notify` | Manda una notificación de prueba. |
-| `detect [--user LOGIN]` | JSON con cuentas, orgs, repos con PRs tuyos, dependencias, config e instalación actual. Es para agentes. |
-| `uninstall` | Quita la programación. La config y el log quedan. |
-| `version` · `help` | Versión y ayuda. |
+| `install [options]` | Saves the config and schedules the run (launchd on macOS; on Linux it prints the `crontab` line). With a terminal and no options, it asks. |
+| `run [--dry-run]` | Runs once now. With `--dry-run` it reports what it would do, without updating branches, notifying or saving state. |
+| `status [--json]` | Config, whether the agent is loaded, the last run, the last error and the tail of the log. |
+| `doctor [--json]` | Checks everything a run needs and says how to fix each problem. Changes nothing. |
+| `log [N]` | The last N log lines (30 by default). |
+| `config` | The config file path and contents. |
+| `test-notify` | Sends a test notification. |
+| `detect [--user LOGIN]` | JSON with accounts, orgs, repos with your PRs, dependencies, config and current install. Meant for agents. |
+| `uninstall` | Removes the schedule. Config and log stay. |
+| `version` · `help` | Version and help. |
 
-Un comando mal escrito sugiere el correcto (`rub` → `run`). Los errores salen por stderr con el
-prefijo `error:` y un código de salida distinto de 0.
+A misspelled command suggests the right one (`rub` → `run`). Errors go to stderr prefixed with
+`error:` and a non-zero exit code.
 
-### Opciones de `install`
+### `install` options
 
-Con cualquiera de estas opciones (salvo `--dry-run`), `install` no pregunta nada: las opciones
-pisan la config que ya tenías y lo que falte sale de los defaults.
+With any of these options (except `--dry-run`), `install` asks nothing: the options override your
+existing config and anything missing comes from the defaults.
 
-| Opción | Qué hace |
+| Option | What it does |
 |---|---|
-| `--user LOGIN` | Cuenta de `gh` a usar (`GH_USER`). |
-| `--owners "A B"` | Orgs o usuarios a vigilar (`OWNERS`). `""` = todos tus PRs. |
-| `--repos "o/r o/r"` | Solo estos repos (`REPOS`); reemplaza a `--owners`. |
-| `--every-hours N` | Cada cuántas horas corre, de 1 a 24 (`EVERY_HOURS`). |
-| `--drafts` · `--no-drafts` | Actualiza o no los drafts (`INCLUDE_DRAFTS`). |
-| `--skip-label L` · `--no-skip-label` | Excluye o no los PRs con la etiqueta L (`SKIP_LABEL`). |
-| `--notify-image PATH` | Imagen de las notificaciones (`NOTIFY_IMAGE`). `""` = el logo. |
-| `--yes` | No pregunta: usa la config existente y los defaults. Sirve para reprogramar después de editar el archivo. |
-| `--dry-run` | Muestra la config y el LaunchAgent que escribiría, sin tocar nada. Sola, igual hace las preguntas. |
+| `--user LOGIN` | `gh` account to use (`GH_USER`). |
+| `--owners "A B"` | Orgs or users to watch (`OWNERS`). `""` = all your PRs. |
+| `--repos "o/r o/r"` | Only these repos (`REPOS`); replaces `--owners`. |
+| `--every-hours N` | How often it runs, 1 to 24 (`EVERY_HOURS`). |
+| `--drafts` · `--no-drafts` | Update drafts or not (`INCLUDE_DRAFTS`). |
+| `--skip-label L` · `--no-skip-label` | Exclude PRs with label L or not (`SKIP_LABEL`). |
+| `--notify-image PATH` | Notification image (`NOTIFY_IMAGE`). `""` = the logo. |
+| `--yes` | Don't ask: use the existing config and the defaults. Useful to reschedule after editing the file. |
+| `--dry-run` | Shows the config and the LaunchAgent it would write, without touching anything. On its own, it still asks the questions. |
 
-## Si algo no anda
+## Troubleshooting
 
 ```bash
 gh pr-watcher doctor
 ```
 
-Marca cada problema con el comando que lo arregla y termina con código distinto de 0 si algo
-falla. No cambia nada ni manda notificaciones. Revisa:
+It flags each problem with the command that fixes it and exits non-zero if something fails. It
+changes nothing and sends no notifications. It checks:
 
-- `gh` y `jq` instalados, y `terminal-notifier` (solo como aviso).
-- La config: claves mal escritas y valores inválidos.
-- La sesión de `gh`, el permiso `repo`, y que cada owner y repo exista y tu cuenta lo vea.
-- La programación: que el LaunchAgent esté cargado, que apunte a un `gh` que todavía existe (brew a
-  veces lo mueve) y que sus horas coincidan con `EVERY_HOURS`.
-- **Que haya corrido.** Es lo único que ninguna notificación avisa: si launchd deja de disparar, no
-  hay error. `doctor` compara la última vuelta con la última hora programada; si la máquina estaba
-  apagada a esa hora no lo marca, y si estaba dormida espera a que launchd la corra al despertar.
-- Otro watcher corriendo a la vez, el último error de una vuelta y un estado dañado.
+- `gh` and `jq` installed, and `terminal-notifier` (as a warning only).
+- The config: misspelled keys and invalid values.
+- The `gh` session, the `repo` scope, and that each owner and repo exists and your account sees it.
+- The schedule: that the LaunchAgent is loaded, that it points to a `gh` that still exists (brew
+  sometimes moves it) and that its hours match `EVERY_HOURS`.
+- **That it actually ran.** No notification covers this: if launchd stops firing, there's no error.
+  `doctor` compares the last run with the last scheduled time; if the machine was off at that time
+  it doesn't flag it, and if it was asleep it waits for launchd to run it on wake.
+- Another watcher running at the same time, the last run's error and a corrupted state.
 
-`doctor --json` devuelve lo mismo para un agente: `{ok, checks: [{id, status, message, fix}]}`.
+`doctor --json` returns the same for an agent: `{ok, checks: [{id, status, message, fix}]}`.
 
-## Actualizar y desinstalar
+## Upgrade and uninstall
 
 ```bash
-gh extension upgrade pr-watcher     # la programación sigue andando, no hace falta reinstalar
+gh extension upgrade pr-watcher     # the schedule keeps working, no need to reinstall
 gh pr-watcher uninstall && gh extension remove pr-watcher
 ```
 
-`uninstall` deja la config y el log; para empezar de cero, borrá también `~/.config/gh-pr-watcher`
-y `~/.local/state/gh-pr-watcher`.
+`uninstall` keeps the config and the log; to start from scratch, also delete
+`~/.config/gh-pr-watcher` and `~/.local/state/gh-pr-watcher`.
 
-## Para tener en cuenta
-
-- **Merge, no rebase.** El endpoint de GitHub hace merge de la base en tu rama. Con squash merge no
-  deja rastro; si el repo exige historia lineal, esos merges estorban.
-- **Tu `git push` puede rebotar.** Si el watcher actualizó una rama que tenés checkouteada, el
-  próximo push es non-fast-forward: `git pull` y listo.
-- **Cada actualización dispara CI.** Antes de repartirlo en un equipo, hacé la cuenta: con la regla
-  de "up to date", cada merge a la base puede terminar en una corrida de CI extra por cada PR ready
-  de cada persona que lo use. El tope es la cantidad de vueltas por día (`EVERY_HOURS`).
-- `gh` lee el token del keychain, y eso funciona bajo launchd. Si el log dice "not logged in",
-  corré `gh pr-watcher doctor`.
-
-## Licencia
+## License
 
 [MIT](LICENSE).

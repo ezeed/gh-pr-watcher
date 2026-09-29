@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# gh-pr-watcher: mantiene al día tus PRs abiertos (lo mismo que el botón "Update branch")
-# y avisa con una notificación cuando un conflicto requiere resolución a mano.
+# gh-pr-watcher: keeps your open PRs up to date (same as the "Update branch" button)
+# and sends a notification when a conflict needs to be resolved by hand.
 set -uo pipefail
 
 VERSION="0.1.0"
@@ -21,7 +21,7 @@ DEFAULT_IMAGE="$SELF_DIR/assets/icon.png"
 
 CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_HOURS INCLUDE_DRAFTS SKIP_LABEL NOTIFY_IMAGE"
 
-# Valores por defecto; el archivo de config los pisa.
+# Defaults; the config file overrides them.
 GH_USER=""
 OWNERS=""
 REPOS=""
@@ -30,50 +30,50 @@ INCLUDE_DRAFTS="false"
 SKIP_LABEL=""
 NOTIFY_IMAGE=""
 
-# IN_RUN=1 dentro de una vuelta real: los errores fatales van al log y se notifican,
-# porque bajo launchd nadie mira stderr.
+# IN_RUN=1 inside a real run: fatal errors go to the log and get notified,
+# because under launchd nobody reads stderr.
 IN_RUN=0
 HAVE_LOCK=0
 GH_ERR_FILE=""
 
 usage() {
   cat <<EOF
-$NAME $VERSION — mantiene al día tus PRs abiertos y avisa los conflictos.
+$NAME $VERSION — keeps your open PRs up to date and flags conflicts.
 
-Uso: gh pr-watcher <comando> [opciones]
+Usage: gh pr-watcher <command> [options]
 
-Comandos:
-  install [opciones]      Guarda la configuración y programa la corrida (launchd en macOS;
-                          en Linux imprime la línea de crontab). Con terminal y sin flags,
-                          pregunta; con flags, --yes o sin terminal, no pregunta nada.
-    --user LOGIN            Cuenta de gh a usar.
-    --owners "A B"          Orgs o usuarios a vigilar ("" = todos tus PRs).
-    --repos "o/r o/r"       Sólo estos repos (reemplaza a --owners).
-    --every-hours N         Cada cuántas horas corre (1-24, desde las 0 hs).
-    --drafts | --no-drafts  Actualizar o no los drafts.
+Commands:
+  install [options]       Saves the config and schedules the run (launchd on macOS;
+                          on Linux it prints the crontab line). With a terminal and no flags,
+                          it asks; with flags, --yes or no terminal, it asks nothing.
+    --user LOGIN            gh account to use.
+    --owners "A B"          Orgs or users to watch ("" = all your PRs).
+    --repos "o/r o/r"       Only these repos (replaces --owners).
+    --every-hours N         Run every N hours (1-24, starting at 0:00).
+    --drafts | --no-drafts  Update drafts or not.
     --skip-label L | --no-skip-label
-                            Excluir los PRs con la etiqueta L.
-    --notify-image PATH     Imagen adjunta a las notificaciones ("" = la incluida).
-    --yes                   No preguntar: config existente + flags + defaults.
-    --dry-run               Mostrar qué escribiría, sin tocar nada.
-  detect [--user LOGIN]   JSON con lo que hace falta para decidir la instalación: cuentas,
-                          orgs, repos con PRs tuyos, dependencias, config e instalación actual.
-  run [--dry-run]         Una vuelta ahora. --dry-run informa sin actualizar ramas,
-                          sin notificar y sin guardar estado.
-  test-notify             Manda una notificación de prueba.
-  doctor [--json]         Revisa dependencias, sesión, config, programación y la última
-                          vuelta, con el arreglo de cada problema. No cambia nada.
-  status [--json]         Config, estado del agente y últimas líneas del log.
-  config                  Muestra la ruta y el contenido del archivo de config.
-  log [N]                 Últimas N líneas del log (default 30).
-  uninstall               Quita la programación. Config y log quedan.
-  version                 Versión.
+                            Exclude PRs with label L.
+    --notify-image PATH     Image attached to notifications ("" = the bundled one).
+    --yes                   Don't ask: existing config + flags + defaults.
+    --dry-run               Show what it would write, without touching anything.
+  detect [--user LOGIN]   JSON with what's needed to decide the install: accounts,
+                          orgs, repos with your PRs, dependencies, current config and install.
+  run [--dry-run]         One run now. --dry-run reports without updating branches,
+                          notifying or saving state.
+  test-notify             Sends a test notification.
+  doctor [--json]         Checks dependencies, session, config, schedule and the last
+                          run, with the fix for each problem. Changes nothing.
+  status [--json]         Config, agent state and the last log lines.
+  config                  Shows the config file path and contents.
+  log [N]                 Last N log lines (default 30).
+  uninstall               Removes the schedule. Config and log stay.
+  version                 Version.
 
-Errores: mensaje en stderr con prefijo "error:" y código de salida distinto de 0.
+Errors: message on stderr prefixed with "error:" and a non-zero exit code.
 
-Archivos:
+Files:
   config  $CONFIG
-  estado  $STATE_DIR/
+  state   $STATE_DIR/
 EOF
 }
 
@@ -83,80 +83,80 @@ die() {
   exit 1
 }
 
-# Error que frena una vuelta real: se loguea y se notifica una sola vez por mensaje distinto.
+# Error that stops a real run: logged, and notified once per distinct message.
 fatal() {
-  log "ERROR: $* (diagnóstico: gh pr-watcher doctor)"
+  log "ERROR: $* (diagnose: gh pr-watcher doctor)"
   if [ "$(cat "$LAST_ERROR" 2>/dev/null)" != "$*" ]; then
     printf '%s\n' "$*" >"$LAST_ERROR"
-    notify "dejó de andar · gh pr-watcher doctor" "$*" "file://$LOG" "error"
+    notify "stopped working · gh pr-watcher doctor" "$*" "file://$LOG" "error"
   fi
   exit 1
 }
 
 warn() {
-  if [ "$IN_RUN" = "1" ]; then log "aviso: $*"; else echo "aviso: $*" >&2; fi
+  if [ "$IN_RUN" = "1" ]; then log "warning: $*"; else echo "warning: $*" >&2; fi
 }
 
-# Sin red no es una falla del watcher: en una vuelta queda para la próxima, sin aviso.
+# No network is not a watcher failure: during a run it waits for the next one, silently.
 offline() {
   if [ "$IN_RUN" = "1" ]; then
-    log "sin conexión con GitHub, queda para la próxima vuelta ($*)"
+    log "no connection to GitHub, will retry next run ($*)"
     exit 0
   fi
-  die "no pude conectar con GitHub: $*"
+  die "could not connect to GitHub: $*"
 }
 
 is_network_error() {
   grep -qiE 'dial tcp|no such host|connection refused|i/o timeout|tls handshake|network is unreachable|context deadline|connection reset' <<<"$1"
 }
 
-# gh con stderr guardado; gh_err devuelve el motivo del último fallo en una línea.
+# gh with stderr captured; gh_err returns the reason for the last failure on one line.
 ghq() { gh "$@" 2>"$GH_ERR_FILE"; }
 gh_err() { grep -v '^{' "$GH_ERR_FILE" 2>/dev/null | head -3 | tr '\n' ' ' | sed 's/ *$//'; }
 
-# Corta con el motivo de gh, separando la falta de red de un error real.
+# Stops with gh's reason, telling a missing network apart from a real error.
 gh_fail() {
   local what="$1" err
   err=$(gh_err)
   is_network_error "$err" && offline "$err"
-  die "$what: ${err:-sin detalle de gh}"
+  die "$what: ${err:-no details from gh}"
 }
 
 valid_hours() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 24 ]; }
 
-# Sin pipe a grep -q: corta la lectura, gh recibe SIGPIPE y pipefail lo da por fallido.
+# No pipe to grep -q: it stops reading, gh gets SIGPIPE and pipefail counts it as failed.
 gh_supports_json() {
   local help
   help=$(gh auth status --help 2>/dev/null)
   [[ "$help" == *"--json"* ]]
 }
 
-require_jq() { command -v jq >/dev/null || die "falta jq (brew install jq)"; }
+require_jq() { command -v jq >/dev/null || die "jq is missing (brew install jq)"; }
 
 require_gh() {
-  command -v gh >/dev/null || die "falta gh, la CLI de GitHub (brew install gh)"
-  gh_supports_json || die "tu gh es muy viejo ($(gh --version 2>/dev/null | head -1)); actualizalo (brew upgrade gh)"
+  command -v gh >/dev/null || die "gh, the GitHub CLI, is missing (brew install gh)"
+  gh_supports_json || die "your gh is too old ($(gh --version 2>/dev/null | head -1)); upgrade it (brew upgrade gh)"
 }
 
-# Sesión válida para GH_USER (o la activa) y con permiso repo, que update-branch necesita.
+# Valid session for GH_USER (or the active one) with the repo scope, which update-branch needs.
 require_session() {
   local hosts login entry state err scopes
   hosts=$(gh auth status --hostname github.com --json hosts 2>/dev/null) \
-    || die "no pude leer la sesión de gh (gh auth status)"
+    || die "could not read the gh session (gh auth status)"
   login="$GH_USER"
   [ -n "$login" ] || login=$(jq -r '.hosts["github.com"][]? | select(.active) | .login' <<<"$hosts")
-  [ -n "$login" ] || die "gh no tiene sesión en github.com; corré gh auth login"
+  [ -n "$login" ] || die "gh has no session on github.com; run gh auth login"
   entry=$(jq -c --arg l "$login" '.hosts["github.com"][]? | select(.login == $l)' <<<"$hosts")
-  [ -n "$entry" ] || die "gh no tiene sesión como '$login'; corré gh auth login"
+  [ -n "$entry" ] || die "gh has no session as '$login'; run gh auth login"
   state=$(jq -r '.state // ""' <<<"$entry")
   if [ "$state" != "success" ]; then
     err=$(jq -r '.error // ""' <<<"$entry")
     is_network_error "$err" && offline "$err"
-    die "la sesión de gh de '$login' no es válida (${err:-$state}); corré gh auth refresh -h github.com"
+    die "the gh session for '$login' is not valid (${err:-$state}); run gh auth refresh -h github.com"
   fi
   scopes=$(jq -r '.scopes // ""' <<<"$entry")
   if [ -n "$scopes" ] && ! [[ ", $scopes," =~ ,\ repo, ]]; then
-    die "al token de '$login' le falta el permiso repo; corré gh auth refresh -h github.com -s repo"
+    die "the token for '$login' is missing the repo scope; run gh auth refresh -h github.com -s repo"
   fi
 }
 
@@ -165,14 +165,14 @@ log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"
 }
 
-# Lee KEY=VALUE sin ejecutar el archivo; ignora comentarios y claves desconocidas.
+# Reads KEY=VALUE without executing the file; ignores comments and unknown keys.
 load_config() {
   [ -f "$CONFIG" ] || return 0
   local line key value
   while IFS= read -r line || [ -n "$line" ]; do
     [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
     if ! [[ "$line" =~ ^[[:space:]]*([A-Za-z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-      warn "línea ignorada en $CONFIG (va KEY=VALUE): $line"
+      warn "ignored line in $CONFIG (expected KEY=VALUE): $line"
       continue
     fi
     key="${BASH_REMATCH[1]}"
@@ -181,7 +181,7 @@ load_config() {
     value="${value#\"}"; value="${value%\"}"
     case " $CONFIG_KEYS " in
       *" $key "*) printf -v "$key" '%s' "$value" ;;
-      *) warn "clave desconocida en $CONFIG: $key$(suggest_key "$key")" ;;
+      *) warn "unknown key in $CONFIG: $key$(suggest_key "$key")" ;;
     esac
   done <"$CONFIG"
 }
@@ -191,7 +191,7 @@ suggest_key() {
   upper=$(tr '[:lower:]' '[:upper:]' <<<"$1")
   for k in $CONFIG_KEYS; do
     if [ "$k" = "$upper" ] || [[ "$k" == "$upper"* ]] || [[ "$upper" == "$k"* ]]; then
-      printf ' (¿quisiste decir %s?)' "$k"
+      printf ' (did you mean %s?)' "$k"
       return 0
     fi
   done
@@ -200,63 +200,63 @@ suggest_key() {
 write_config() {
   mkdir -p "$CONFIG_DIR"
   cat >"$CONFIG" <<EOF
-# $NAME — se lee como KEY=VALUE, no se ejecuta. Editalo y listo: la próxima vuelta lo toma.
-# Si cambiás EVERY_HOURS, corré \`gh pr-watcher install --yes\` para reprogramar.
+# $NAME — read as KEY=VALUE, never executed. Edit it and you're done: the next run picks it up.
+# If you change EVERY_HOURS, run \`gh pr-watcher install --yes\` to reschedule.
 
-# Cuenta de gh a usar (\`gh auth status\` las lista). Vacío = la cuenta activa.
+# gh account to use (\`gh auth status\` lists them). Empty = the active account.
 GH_USER=$GH_USER
 
-# Dueños (orgs o usuarios) separados por espacio. Vacío = todos tus PRs abiertos en GitHub.
+# Owners (orgs or users) separated by spaces. Empty = all your open PRs on GitHub.
 OWNERS=$OWNERS
 
-# Repos puntuales owner/repo separados por espacio. Si hay alguno, se vigilan sólo esos y OWNERS no cuenta.
+# Specific owner/repo repos separated by spaces. If any is set, only those are watched and OWNERS is ignored.
 REPOS=$REPOS
 
-# Cada cuántas horas corre (1-24), contando desde las 0 hs: 6 = 0, 6, 12 y 18 hs.
+# Run every N hours (1-24), counting from 0:00: 6 = 0:00, 6:00, 12:00 and 18:00.
 EVERY_HOURS=$EVERY_HOURS
 
-# true = también actualiza los drafts.
+# true = also update drafts.
 INCLUDE_DRAFTS=$INCLUDE_DRAFTS
 
-# Los PRs con esta etiqueta no se tocan (por ejemplo no-autoupdate). Vacío = ninguno se excluye.
+# PRs with this label are left alone (e.g. no-autoupdate). Empty = none are excluded.
 SKIP_LABEL=$SKIP_LABEL
 
-# Imagen PNG/JPG local adjunta a las notificaciones (sólo con terminal-notifier). Vacío = la incluida.
+# Local PNG/JPG image attached to notifications (terminal-notifier only). Empty = the bundled one.
 NOTIFY_IMAGE=$NOTIFY_IMAGE
 EOF
 }
 
 validate_config() {
-  valid_hours "$EVERY_HOURS" || die "EVERY_HOURS tiene que ser un número de 1 a 24 (vale '$EVERY_HOURS')"
-  case "$OWNERS" in *,*) die "OWNERS va separado por espacios, no por comas (vale '$OWNERS')" ;; esac
-  case "$REPOS" in *,*) die "REPOS va separado por espacios, no por comas (vale '$REPOS')" ;; esac
+  valid_hours "$EVERY_HOURS" || die "EVERY_HOURS must be a number from 1 to 24 (got '$EVERY_HOURS')"
+  case "$OWNERS" in *,*) die "OWNERS must be separated by spaces, not commas (got '$OWNERS')" ;; esac
+  case "$REPOS" in *,*) die "REPOS must be separated by spaces, not commas (got '$REPOS')" ;; esac
   local ow
   for ow in $GH_USER $OWNERS; do
-    [[ "$ow" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]] || die "'$ow' no es un usuario u org válido de GitHub"
+    [[ "$ow" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]] || die "'$ow' is not a valid GitHub user or org"
   done
-  [ -z "$GH_USER" ] || [ "$(wc -w <<<"$GH_USER" | tr -d ' ')" = "1" ] || die "GH_USER es una sola cuenta (vale '$GH_USER')"
+  [ -z "$GH_USER" ] || [ "$(wc -w <<<"$GH_USER" | tr -d ' ')" = "1" ] || die "GH_USER is a single account (got '$GH_USER')"
   if [ -n "$NOTIFY_IMAGE" ] && [ ! -r "$NOTIFY_IMAGE" ]; then
-    die "NOTIFY_IMAGE no es un archivo que se pueda leer: '$NOTIFY_IMAGE'"
+    die "NOTIFY_IMAGE is not a readable file: '$NOTIFY_IMAGE'"
   fi
   local rp
   for rp in $REPOS; do
-    [[ "$rp" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "REPOS tiene un repo inválido: '$rp' (va owner/repo)"
+    [[ "$rp" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "REPOS has an invalid repo: '$rp' (expected owner/repo)"
   done
   local b
   for b in INCLUDE_DRAFTS; do
-    case "${!b}" in true|false) ;; *) die "$b tiene que ser true o false (vale '${!b}')" ;; esac
+    case "${!b}" in true|false) ;; *) die "$b must be true or false (got '${!b}')" ;; esac
   done
 }
 
-# Con GH_USER, toda la corrida usa el token de esa cuenta aunque la activa sea otra.
+# With GH_USER, the whole run uses that account's token even if another one is active.
 use_account() {
   [ -n "$GH_USER" ] || return 0
   local token
-  token=$(gh auth token --user "$GH_USER" 2>/dev/null) || die "gh no tiene sesión como '$GH_USER'; corré gh auth login"
+  token=$(gh auth token --user "$GH_USER" 2>/dev/null) || die "gh has no session as '$GH_USER'; run gh auth login"
   export GH_TOKEN="$token"
 }
 
-# Notificación de sistema; en macOS el click abre el PR. Sin notificador disponible, sólo queda el log.
+# System notification; on macOS clicking it opens the PR. With no notifier available, only the log remains.
 notify() { # subtitle message url group
   if command -v terminal-notifier >/dev/null; then
     local img="${NOTIFY_IMAGE:-$DEFAULT_IMAGE}" extra=()
@@ -277,8 +277,8 @@ APPLESCRIPT
   return 0
 }
 
-# Conserva el estado anterior del PR cuando una vuelta no llega a una respuesta nueva;
-# sin esto, un conflicto ya avisado se vuelve a avisar. Usa las variables de cmd_run.
+# Keeps the PR's previous state when a run gets no new answer;
+# without this, an already notified conflict gets notified again. Uses cmd_run's variables.
 keep_prev() {
   [ -n "$prev" ] && new_state=$(jq --arg k "$key" --arg v "$prev" '.[$k]=$v' <<<"$new_state")
   return 0
@@ -289,14 +289,14 @@ cmd_run() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run) dry_run=1 ;;
-      *) die "opción desconocida para run: $1" ;;
+      *) die "unknown option for run: $1" ;;
     esac
     shift
   done
 
   [ "$dry_run" = "1" ] || IN_RUN=1
   mkdir -p "$STATE_DIR"
-  # Cuenta cualquier vuelta real, aunque después falle o no haya red: doctor lo usa para saber si launchd dispara.
+  # Records every real run, even if it later fails or has no network: doctor uses it to tell whether launchd fires.
   [ "$IN_RUN" = "1" ] && date +%s >"$LAST_RUN"
   load_config
   validate_config
@@ -305,7 +305,7 @@ cmd_run() {
   require_session
   use_account
   if ! acquire_lock; then
-    log "ya hay una vuelta corriendo (pid $(cat "$LOCK_DIR/pid" 2>/dev/null)), esta se saltea"
+    log "a run is already in progress (pid $(cat "$LOCK_DIR/pid" 2>/dev/null)), skipping this one"
     return 0
   fi
 
@@ -314,14 +314,14 @@ cmd_run() {
     if jq -e 'type == "object"' "$STATE" >/dev/null 2>&1; then
       old_state=$(cat "$STATE")
     else
-      warn "el estado ($STATE) estaba dañado y se descarta; los conflictos abiertos se van a volver a avisar"
+      warn "the state ($STATE) was corrupted and is discarded; open conflicts will be notified again"
     fi
   fi
 
   local args=(search prs --author @me --state open --limit 100
     --json repository,number,isDraft,labels,title,url)
   local o r
-  # gh search combina --owner y --repo con AND: con repos elegidos, las orgs no se pasan.
+  # gh search ANDs --owner and --repo: when repos are chosen, orgs are not passed.
   if [ -n "$REPOS" ]; then
     for r in $REPOS; do args+=(--repo "$r"); done
   else
@@ -329,7 +329,7 @@ cmd_run() {
   fi
 
   local found
-  found=$(ghq "${args[@]}") || gh_fail "la búsqueda de PRs en GitHub falló"
+  found=$(ghq "${args[@]}") || gh_fail "the PR search on GitHub failed"
 
   local prs
   prs=$(jq -r --arg skip "$SKIP_LABEL" --argjson drafts "$INCLUDE_DRAFTS" '
@@ -339,15 +339,15 @@ cmd_run() {
 
   local skipped
   skipped=$(jq -r --arg skip "$SKIP_LABEL" --argjson drafts "$INCLUDE_DRAFTS" '
-    .[] | if (.isDraft and ($drafts | not)) then "\(.repository.nameWithOwner)#\(.number): draft, no se toca"
-          elif ($skip != "" and ([.labels[].name] | index($skip))) then "\(.repository.nameWithOwner)#\(.number): etiqueta \($skip), no se toca"
+    .[] | if (.isDraft and ($drafts | not)) then "\(.repository.nameWithOwner)#\(.number): draft, left alone"
+          elif ($skip != "" and ([.labels[].name] | index($skip))) then "\(.repository.nameWithOwner)#\(.number): label \($skip), left alone"
           else empty end' <<<"$found")
   [ -n "$skipped" ] && while read -r line; do log "$line"; done <<<"$skipped"
 
   if [ -z "$prs" ]; then
-    # El estado no se borra: con la cuenta equivocada la búsqueda vuelve vacía, y al volver
-    # a la correcta se repetirían los avisos. Cada vuelta con PRs lo reconstruye igual.
-    [ -z "$skipped" ] && log "sin PRs abiertos"
+    # The state is not wiped: with the wrong account the search comes back empty, and switching
+    # back to the right one would repeat the notifications. Every run with PRs rebuilds it anyway.
+    [ -z "$skipped" ] && log "no open PRs"
     run_ok
     return 0
   fi
@@ -358,7 +358,7 @@ cmd_run() {
     key="$repo#$num"
     prev=$(jq -r --arg k "$key" '.[$k] // ""' <<<"$old_state")
 
-    # GitHub calcula mergeable en forma perezosa: la primera consulta suele devolver UNKNOWN.
+    # GitHub computes mergeable lazily: the first query usually returns UNKNOWN.
     info=""
     for attempt in 1 2 3 4; do
       info=$(gh pr view "$num" -R "$repo" \
@@ -369,7 +369,7 @@ cmd_run() {
       sleep $((attempt * 5))
     done
     if [ -z "$info" ]; then
-      log "$key: no pude leer el PR, queda para la próxima vuelta"
+      log "$key: could not read the PR, will retry next run"
       keep_prev
       continue
     fi
@@ -385,30 +385,30 @@ cmd_run() {
     case "$mergeable" in
       CONFLICTING)
         if [ "$prev" != "CONFLICTING" ] && [ "$dry_run" = "1" ]; then
-          log "$key: CONFLICTO ($behind atrás) → (dry-run) avisaría"
+          log "$key: CONFLICT ($behind behind) → (dry-run) would notify"
         elif [ "$prev" != "CONFLICTING" ]; then
-          log "$key: CONFLICTO ($behind atrás) → aviso"
-          notify "$key · conflicto que requiere atención" "$title ($behind commits atrás de $base)." "$url" "$key"
+          log "$key: CONFLICT ($behind behind) → notifying"
+          notify "$key · conflict needs attention" "$title ($behind commits behind $base)." "$url" "$key"
         else
-          log "$key: sigue en conflicto ($behind atrás), ya avisado"
+          log "$key: still conflicting ($behind behind), already notified"
         fi
         new_state=$(jq --arg k "$key" '.[$k]="CONFLICTING"' <<<"$new_state") ;;
       MERGEABLE)
         if [ "$prev" = "CONFLICTING" ]; then
-          log "$key: conflicto resuelto"
+          log "$key: conflict resolved"
         fi
         if [ "$behind" = "0" ]; then
-          log "$key: al día"
+          log "$key: up to date"
         elif [ "$dry_run" = "1" ]; then
-          log "$key: $behind atrás → (dry-run) actualizaría la rama"
+          log "$key: $behind behind → (dry-run) would update the branch"
         elif out=$(gh api -X PUT "repos/$repo/pulls/$num/update-branch" -f expected_head_sha="$oid" 2>&1); then
-          log "$key: $behind atrás → rama actualizada desde $base (CI va a correr)"
+          log "$key: $behind behind → branch updated from $base (CI will run)"
         else
-          log "$key: $behind atrás, no se actualizó: $(tr '\n' ' ' <<<"$out")"
+          log "$key: $behind behind, not updated: $(tr '\n' ' ' <<<"$out")"
         fi
         new_state=$(jq --arg k "$key" '.[$k]="MERGEABLE"' <<<"$new_state") ;;
       *)
-        log "$key: GitHub todavía calcula mergeable ($mergeable), se salta esta vuelta"
+        log "$key: GitHub is still computing mergeable ($mergeable), skipping this run"
         keep_prev ;;
     esac
   done <<<"$prs"
@@ -419,14 +419,14 @@ cmd_run() {
   run_ok
 }
 
-# Una vuelta real que terminó bien borra el último error (sin notificar: sólo lo anota).
+# A real run that finished fine clears the last error (without notifying: it only logs it).
 run_ok() {
   [ "$IN_RUN" = "1" ] && [ -f "$LAST_ERROR" ] || return 0
-  log "vuelve a andar (el último error era: $(cat "$LAST_ERROR"))"
+  log "working again (the last error was: $(cat "$LAST_ERROR"))"
   rm -f "$LAST_ERROR"
 }
 
-# Lock por directorio (mkdir es atómico); uno huérfano de un proceso muerto se retoma.
+# Directory lock (mkdir is atomic); an orphan left by a dead process is taken over.
 acquire_lock() {
   local pid
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -445,7 +445,7 @@ cleanup() {
   ui_restore
 }
 
-# Detección: una línea por resultado. Las usan install (interactivo) y detect (JSON).
+# Detection: one line per result. Used by install (interactive) and detect (JSON).
 list_accounts() {
   gh auth status --hostname github.com --json hosts --jq '.hosts["github.com"][].login' 2>/dev/null
 }
@@ -455,12 +455,12 @@ active_account() {
     --jq '.hosts["github.com"][] | select(.active) | .login' 2>/dev/null
 }
 
-# Requiere use_account antes, para que las consultas salgan con la cuenta elegida.
+# Needs use_account first, so the queries go out as the chosen account.
 list_orgs() {
   ghq api user/orgs --paginate --jq '.[].login'
 }
 
-# Repos con PRs tuyos (abiertos o entre los 100 más recientes), filtrados por owners si hay.
+# Repos with your PRs (open or among the 100 most recent), filtered by owners if any.
 list_pr_repos() {
   local owners="$1" open recent
   open=$(ghq search prs --author @me --state open --limit 100 --json repository) || return 1
@@ -469,26 +469,26 @@ list_pr_repos() {
       | select(. as $repo | $owners == "" or ($owners | split(" ") | index($repo | split("/")[0])))' | sort -u
 }
 
-# Cada owner y repo de la config tiene que existir y ser visible para la cuenta.
+# Every owner and repo in the config must exist and be visible to the account.
 check_targets() {
   local o r err
   for o in $OWNERS; do
     ghq api "users/$o" --jq .login >/dev/null && continue
     err=$(gh_err)
     is_network_error "$err" && offline "$err"
-    case "$err" in *"HTTP 404"*) die "no existe el usuario u org '$o' en GitHub" ;; esac
-    die "no pude verificar '$o': $err"
+    case "$err" in *"HTTP 404"*) die "user or org '$o' does not exist on GitHub" ;; esac
+    die "could not verify '$o': $err"
   done
   for r in $REPOS; do
     ghq api "repos/$r" --jq .full_name >/dev/null && continue
     err=$(gh_err)
     is_network_error "$err" && offline "$err"
-    case "$err" in *"HTTP 404"*) die "el repo '$r' no existe o tu cuenta no tiene acceso" ;; esac
-    die "no pude verificar '$r': $err"
+    case "$err" in *"HTTP 404"*) die "repo '$r' does not exist or your account has no access to it" ;; esac
+    die "could not verify '$r': $err"
   done
 }
 
-# Otros LaunchAgents de pr-watcher o de un babysitter casero: correr dos a la vez duplica updates y avisos.
+# Other LaunchAgents from pr-watcher or a homemade babysitter: two running at once duplicate updates and notifications.
 other_agents() {
   [ "$(uname -s)" = "Darwin" ] || return 0
   launchctl list 2>/dev/null | awk 'NR > 1 {print $3}' | grep -iE 'pr-watcher|babysitter' | grep -vx "$LABEL" || true
@@ -498,7 +498,7 @@ agent_loaded() {
   [ "$(uname -s)" = "Darwin" ] && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
 }
 
-# JSON array desde líneas en stdin.
+# JSON array from lines on stdin.
 lines_json() { jq -R . | jq -s 'map(select(. != ""))'; }
 
 cmd_detect() {
@@ -508,12 +508,12 @@ cmd_detect() {
       --user) user="${2:-}"; shift ;;
       --user=*) user="${1#*=}" ;;
       --json) ;;
-      *) die "opción desconocida para detect: $1" ;;
+      *) die "unknown option for detect: $1" ;;
     esac
     shift
   done
   if ! command -v jq >/dev/null; then
-    printf '{"errors":[{"step":"deps","message":"falta jq (brew install jq)"}]}\n'
+    printf '{"errors":[{"step":"deps","message":"jq is missing (brew install jq)"}]}\n'
     exit 1
   fi
   local errors=""
@@ -524,10 +524,10 @@ cmd_detect() {
   local accounts="" active="" account="" cfg_user="$GH_USER" token
   local orgs="" repos="" os scheduler gh_ok=1
   if ! command -v gh >/dev/null; then
-    errors+=$(jq -cn '{step:"deps",message:"falta gh, la CLI de GitHub (brew install gh)"}')$'\n'
+    errors+=$(jq -cn '{step:"deps",message:"gh, the GitHub CLI, is missing (brew install gh)"}')$'\n'
     gh_ok=0
   elif ! gh_supports_json; then
-    errors+=$(jq -cn --arg v "$(gh --version | head -1)" '{step:"deps",message:("tu gh es muy viejo (" + $v + "); actualizalo (brew upgrade gh)")}')$'\n'
+    errors+=$(jq -cn --arg v "$(gh --version | head -1)" '{step:"deps",message:("your gh is too old (" + $v + "); upgrade it (brew upgrade gh)")}')$'\n'
     gh_ok=0
   fi
   if [ "$gh_ok" = "1" ]; then
@@ -535,15 +535,15 @@ cmd_detect() {
     active=$(active_account)
     account="${user:-${GH_USER:-$active}}"
     if [ -z "$accounts" ]; then
-      errors+=$(jq -cn '{step:"auth",message:"gh no tiene sesión en github.com; corré gh auth login"}')$'\n'
+      errors+=$(jq -cn '{step:"auth",message:"gh has no session on github.com; run gh auth login"}')$'\n'
     elif ! token=$(gh auth token --user "$account" 2>/dev/null); then
-      errors+=$(jq -cn --arg m "gh no tiene sesión como '$account'; corré gh auth login" '{step:"auth",message:$m}')$'\n'
+      errors+=$(jq -cn --arg m "gh has no session as '$account'; run gh auth login" '{step:"auth",message:$m}')$'\n'
     else
       export GH_TOKEN="$token"
       orgs=$(list_orgs) \
-        || errors+=$(jq -cn --arg m "$(gh_err)" '{step:"orgs",message:("no pude listar las orgs: " + $m)}')$'\n'
+        || errors+=$(jq -cn --arg m "$(gh_err)" '{step:"orgs",message:("could not list the orgs: " + $m)}')$'\n'
       repos=$(list_pr_repos "") \
-        || errors+=$(jq -cn --arg m "$(gh_err)" '{step:"repos",message:("no pude listar los repos con PRs: " + $m)}')$'\n'
+        || errors+=$(jq -cn --arg m "$(gh_err)" '{step:"repos",message:("could not list the repos with PRs: " + $m)}')$'\n'
     fi
   fi
   os=$(uname -s)
@@ -595,8 +595,8 @@ cmd_detect() {
     }'
 }
 
-# Interfaz del instalador. Con una terminal capaz: menús con flechas al estilo de create-vite.
-# Sin ella (TERM=dumb o stty no responde): los menús numerados, que funcionan en cualquier lado.
+# Installer UI. With a capable terminal: arrow-key menus in the style of create-vite.
+# Without one (TERM=dumb or stty doesn't respond): numbered menus, which work anywhere.
 FANCY=0
 C_RESET="" C_DIM="" C_CYAN="" C_GREEN="" C_BOLD=""
 S_START="+" S_BAR="|" S_END="+" S_ACTIVE="*" S_DONE="o" S_ON="[x]" S_OFF="[ ]" S_RON="(*)" S_ROFF="( )"
@@ -608,7 +608,7 @@ ui_init() {
   STTY_SAVED=$(stty -g </dev/tty 2>/dev/null) || { STTY_SAVED=""; return 0; }
   exec 4>/dev/tty || return 0
   FANCY=1
-  # Sin eco, una tecla apretada mientras gh consulta la red no ensucia el menú: la lee el paso siguiente.
+  # With echo off, a key pressed while gh queries the network doesn't garble the menu: the next step reads it.
   stty -echo </dev/tty 2>/dev/null
   trap 'exit 130' INT
   if [ -z "${NO_COLOR:-}" ]; then
@@ -620,21 +620,21 @@ ui_init() {
   esac
 }
 
-# Deja la terminal como estaba aunque el instalador corte por un error o por Ctrl-C.
+# Leaves the terminal as it was even if the installer stops on an error or Ctrl-C.
 ui_restore() {
   [ "$CURSOR_HIDDEN" = "1" ] && printf '\e[?25h' >/dev/tty 2>/dev/null
   [ -n "$STTY_SAVED" ] && stty "$STTY_SAVED" </dev/tty 2>/dev/null
   return 0
 }
 
-# Una terminal que no informa su ancho (o informa 0) se trata como de 80 columnas.
+# A terminal that doesn't report its width (or reports 0) is treated as 80 columns.
 ui_cols() {
   local c
   c=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
   if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ]; then echo "$c"; else echo 80; fi
 }
 
-# Recorta al ancho de la terminal: una línea que se parte rompe el redibujado del menú.
+# Truncates to the terminal width: a wrapped line breaks the menu redraw.
 ui_fit() {
   local max=$(($(ui_cols) - 8)) s="$1"
   [ "${#s}" -le "$max" ] || s="${s:0:max-1}…"
@@ -645,16 +645,16 @@ ui_intro() { printf '%s%s%s  %s%s%s\n%s%s%s\n' "$C_DIM" "$S_START" "$C_RESET" "$
 ui_outro() { printf '%s%s%s  %s\n' "$C_DIM" "$S_END" "$C_RESET" "$1" >&4; }
 ui_line() { printf '%s%s%s  %s\n' "$C_DIM" "$S_BAR" "$C_RESET" "$1" >&4; }
 
-# Paso respondido: la pregunta queda colapsada con su respuesta.
+# Answered step: the question collapses with its answer.
 ui_done() {
   printf '%s%s%s  %s\n' "$C_GREEN" "$S_DONE" "$C_RESET" "$1" >&4
   printf '%s%s%s  %s%s%s\n%s%s%s\n' "$C_DIM" "$S_BAR" "$C_RESET" "$C_DIM" "$(ui_fit "$2")" "$C_RESET" "$C_DIM" "$S_BAR" "$C_RESET" >&4
 }
 
-# Una línea de salida del instalador: dentro del marco si lo hay, a stdout si no.
+# One installer output line: inside the frame if there is one, to stdout if not.
 report() { if [ "$FANCY" = "1" ]; then ui_line "$*"; else echo "$*"; fi; }
 
-# KEY queda en up, down, left, right, enter, space o la tecla tal cual.
+# KEY ends up as up, down, left, right, enter, space or the key as typed.
 read_key() {
   local k rest=""
   if ! IFS= read -rsn1 k </dev/tty; then KEY=enter; return 0; fi
@@ -672,8 +672,8 @@ read_key() {
   esac
 }
 
-# Menú con flechas sobre LP_LABELS; one = elige una (LP_CUR), many = marca varias (LP_ON), y en many
-# la última opción es "todos".
+# Arrow-key menu over LP_LABELS; one = pick one (LP_CUR), many = check several (LP_ON), and in many
+# the last option is "all".
 list_prompt() {
   local mode="$1" question="$2" hint="$3" n=${#LP_LABELS[@]} i drawn=0 mark color
   printf '\e[?25l' >&4
@@ -700,7 +700,7 @@ list_prompt() {
       down) LP_CUR=$(((LP_CUR + 1) % n)) ;;
       space) if [ "$mode" = "many" ]; then
                if [ "${LP_ON[LP_CUR]}" = "1" ]; then LP_ON[LP_CUR]=0; else LP_ON[LP_CUR]=1; fi
-               # La última opción ("todos") excluye a las demás.
+               # The last option ("all") excludes the others.
                if [ "${LP_ON[LP_CUR]}" = "1" ]; then
                  for ((i = 0; i < n; i++)); do
                    if [ "$LP_CUR" -eq $((n - 1)) ] && [ "$i" -ne "$LP_CUR" ]; then LP_ON[i]=0; fi
@@ -715,8 +715,8 @@ list_prompt() {
   CURSOR_HIDDEN=0
 }
 
-# choose_one VAR "pregunta" "valor|texto"...: Enter (o el número vacío) conserva el valor actual de VAR.
-# Sin "|", el valor es el texto.
+# choose_one VAR "question" "value|text"...: Enter (or an empty number) keeps VAR's current value.
+# Without "|", the value is the text.
 choose_one() {
   local var="$1" question="$2" i=1 answer current_idx="" item values=() labels=()
   shift 2
@@ -727,7 +727,7 @@ choose_one() {
   if [ "$FANCY" = "1" ]; then
     LP_LABELS=("${labels[@]}")
     LP_CUR="${current_idx:-0}"
-    list_prompt one "$question" "↑↓ elegir · enter confirmar"
+    list_prompt one "$question" "↑↓ choose · enter confirm"
     printf -v "$var" '%s' "${values[LP_CUR]}"
     ui_done "$question" "${labels[LP_CUR]}"
     return 0
@@ -735,20 +735,20 @@ choose_one() {
   echo "$question" >/dev/tty
   for ((i = 0; i < ${#labels[@]}; i++)); do printf '  %d) %s\n' $((i + 1)) "${labels[i]}" >/dev/tty; done
   while true; do
-    printf '  Número [%s]: ' $((${current_idx:-0} + 1)) >/dev/tty
+    printf '  Number [%s]: ' $((${current_idx:-0} + 1)) >/dev/tty
     IFS= read -r answer </dev/tty || answer=""
     answer="${answer:-$((${current_idx:-0} + 1))}"
     if [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le ${#values[@]} ]; then
       printf -v "$var" '%s' "${values[answer - 1]}"
       return 0
     fi
-    echo "  Elegí un número de la lista." >/dev/tty
+    echo "  Pick a number from the list." >/dev/tty
   done
 }
 
-# choose_many VAR "pregunta" "texto de todos" "valor|sufijo"...: varios valores separados por espacio.
-# La opción "todos" (o "*" en los menús numerados) o nada marcado deja VAR vacío, que para quien llama
-# significa "todos".
+# choose_many VAR "question" "all text" "value|suffix"...: several values separated by spaces.
+# The "all" option (or "*" in the numbered menus) or nothing checked leaves VAR empty, which for the
+# caller means "all".
 choose_many() {
   local var="$1" question="$2" all_text="$3" i=1 answer current="" item n picked ok
   shift 3
@@ -761,7 +761,7 @@ choose_many() {
     LP_LABELS+=("$all_text")
     if [ -z "${!var}" ]; then LP_ON+=(1); else LP_ON+=(0); fi
     LP_CUR=0
-    list_prompt many "$question" "↑↓ moverse · espacio marcar · enter seguir"
+    list_prompt many "$question" "↑↓ move · space select · enter continue"
     picked=""
     i=0
     for item in "$@"; do
@@ -779,7 +779,7 @@ choose_many() {
     i=$((i + 1))
   done
   while true; do
-    printf '  Números separados por espacio, "*" = %s [%s]: ' "$all_text" "${current:-*}" >/dev/tty
+    printf '  Numbers separated by spaces, "*" = %s [%s]: ' "$all_text" "${current:-*}" >/dev/tty
     IFS= read -r answer </dev/tty || answer=""
     answer="${answer:-${current:-*}}"
     if [ "$answer" = "*" ]; then printf -v "$var" '%s' ""; return 0; fi
@@ -792,11 +792,11 @@ choose_many() {
       fi
     done
     if [ "$ok" = "1" ] && [ -n "$picked" ]; then printf -v "$var" '%s' "$picked"; return 0; fi
-    echo "  Elegí números de la lista, o \"*\"." >/dev/tty
+    echo "  Pick numbers from the list, or \"*\"." >/dev/tty
   done
 }
 
-# ask_bool VAR "pregunta": Sí/No con flechas o con s/n; en los menús numerados, s/n escrito.
+# ask_bool VAR "question": Yes/No with arrows or y/n; in the numbered menus, y/n typed.
 ask_bool() {
   local var="$1" question="$2" answer yes=0 drawn=0
   [ "${!var}" = "true" ] && yes=1
@@ -807,61 +807,61 @@ ask_bool() {
       [ "$drawn" -gt 0 ] && printf '\e[%dA\e[J' "$drawn" >&4
       printf '%s%s%s  %s\n' "$C_CYAN" "$S_ACTIVE" "$C_RESET" "$question" >&4
       if [ "$yes" = "1" ]; then
-        printf '%s%s%s  %s%s Sí%s %s/ %s No%s\n' "$C_CYAN" "$S_BAR" "$C_RESET" "$C_CYAN" "$S_RON" "$C_RESET" "$C_DIM" "$S_ROFF" "$C_RESET" >&4
+        printf '%s%s%s  %s%s Yes%s %s/ %s No%s\n' "$C_CYAN" "$S_BAR" "$C_RESET" "$C_CYAN" "$S_RON" "$C_RESET" "$C_DIM" "$S_ROFF" "$C_RESET" >&4
       else
-        printf '%s%s%s  %s%s Sí /%s %s%s No%s\n' "$C_CYAN" "$S_BAR" "$C_RESET" "$C_DIM" "$S_ROFF" "$C_RESET" "$C_CYAN" "$S_RON" "$C_RESET" >&4
+        printf '%s%s%s  %s%s Yes /%s %s%s No%s\n' "$C_CYAN" "$S_BAR" "$C_RESET" "$C_DIM" "$S_ROFF" "$C_RESET" "$C_CYAN" "$S_RON" "$C_RESET" >&4
       fi
       printf '%s%s%s\n' "$C_CYAN" "$S_END" "$C_RESET" >&4
       drawn=3
       read_key
       case "$KEY" in
         left|right|up|down|space) yes=$((1 - yes)) ;;
-        s|S|y|Y) yes=1; break ;;
+        y|Y|s|S) yes=1; break ;;
         n|N) yes=0; break ;;
         enter) break ;;
       esac
     done
     printf '\e[%dA\e[J\e[?25h' "$drawn" >&4
     CURSOR_HIDDEN=0
-    if [ "$yes" = "1" ]; then printf -v "$var" true; ui_done "$question" "Sí"; else printf -v "$var" false; ui_done "$question" "No"; fi
+    if [ "$yes" = "1" ]; then printf -v "$var" true; ui_done "$question" "Yes"; else printf -v "$var" false; ui_done "$question" "No"; fi
     return 0
   fi
   while true; do
-    printf '%s (s/n)\n  [%s]: ' "$question" "$([ "$yes" = "1" ] && echo s || echo n)" >/dev/tty
+    printf '%s (y/n)\n  [%s]: ' "$question" "$([ "$yes" = "1" ] && echo y || echo n)" >/dev/tty
     IFS= read -r answer </dev/tty || answer=""
     case "$answer" in
       "") break ;;
-      s|S|si|sí|y|yes|true) yes=1; break ;;
-      n|N|no|false) yes=0; break ;;
-      *) echo "  Respondé s o n." >/dev/tty ;;
+      y|Y|yes|Yes|YES|true|s|S|si) yes=1; break ;;
+      n|N|no|No|NO|false) yes=0; break ;;
+      *) echo "  Answer y or n." >/dev/tty ;;
     esac
   done
   if [ "$yes" = "1" ]; then printf -v "$var" true; else printf -v "$var" false; fi
 }
 
-# "0, 6, 12 y 18" a partir de "0 6 12 18".
+# "0:00, 6:00, 12:00 and 18:00" from "0:00 6:00 12:00 18:00".
 join_hours() {
   local list="$1" out="" h last=""
   for h in $list; do
     [ -n "$last" ] && out="${out:+$out, }$last"
     last=$h
   done
-  if [ -n "$out" ]; then echo "$out y $last"; else echo "$last"; fi
+  if [ -n "$out" ]; then echo "$out and $last"; else echo "$last"; fi
 }
 
-# Texto de cada opción de frecuencia: con pocas vueltas, las horas; con muchas, cuántas por día.
+# Label for each frequency option: with few runs, the hours; with many, how many per day.
 hours_label() {
   local every="$1" h=0 hours="" count=0
-  while [ "$h" -lt 24 ]; do hours="${hours:+$hours }$h"; h=$((h + every)); count=$((count + 1)); done
+  while [ "$h" -lt 24 ]; do hours="${hours:+$hours }$h:00"; h=$((h + every)); count=$((count + 1)); done
   case "$every" in
-    1) echo "cada hora · 24 vueltas por día" ;;
-    24) echo "una vez por día · a las 0 hs" ;;
-    *) if [ "$count" -le 6 ]; then echo "cada $every hs · a las $(join_hours "$hours") hs"
-       else echo "cada $every hs · $count vueltas por día"; fi ;;
+    1) echo "every hour · 24 runs a day" ;;
+    24) echo "once a day · at 0:00" ;;
+    *) if [ "$count" -le 6 ]; then echo "every $every h · at $(join_hours "$hours")"
+       else echo "every $every h · $count runs a day"; fi ;;
   esac
 }
 
-# Horas de corrida: desde las 0 hs, cada EVERY_HOURS.
+# Run hours: from 0:00, every EVERY_HOURS.
 schedule_hours() {
   local h=0 hours=""
   while [ "$h" -lt 24 ]; do
@@ -903,7 +903,7 @@ EOF
 EOF
 }
 
-# PATH mínimo para launchd: las carpetas donde están gh, jq y terminal-notifier, más las del sistema.
+# Minimal PATH for launchd: the folders holding gh, jq and terminal-notifier, plus the system ones.
 schedule_path() {
   local dirs="" tool dir
   for tool in gh jq terminal-notifier; do
@@ -926,7 +926,7 @@ cmd_install() {
     case "$opt" in
       --*=*) val="${opt#*=}"; opt="${opt%%=*}" ;;
       --user|--owners|--repos|--every-hours|--skip-label|--notify-image)
-        [ $# -ge 2 ] || die "$opt necesita un valor"
+        [ $# -ge 2 ] || die "$opt needs a value"
         val="$2"; shift ;;
     esac
     case "$opt" in
@@ -941,7 +941,7 @@ cmd_install() {
       --skip-label) f_skip="$val"; set_skip=1 ;;
       --no-skip-label) f_skip=""; set_skip=1 ;;
       --notify-image) f_image="$val"; set_image=1 ;;
-      *) die "opción desconocida para install: $opt" ;;
+      *) die "unknown option for install: $opt" ;;
     esac
     shift
   done
@@ -960,13 +960,13 @@ cmd_install() {
   [ "$set_skip" = "1" ] && SKIP_LABEL="$f_skip"
   [ "$set_image" = "1" ] && NOTIFY_IMAGE="$f_image"
 
-  # Sin terminal (un agente, un script) o con flags, no se pregunta nada.
+  # With no terminal (an agent, a script) or with flags, nothing is asked.
   local interactive=1
   if [ "$yes" = "1" ] || [ "$flags" -gt 0 ]; then
     interactive=0
   elif ! { : </dev/tty; } 2>/dev/null; then
     interactive=0
-    echo "Sin terminal: se instala con la config existente y los defaults (ver --help para los flags)." >&2
+    echo "No terminal: installing with the existing config and the defaults (see --help for the flags)." >&2
   fi
 
   if [ "$interactive" = "0" ]; then
@@ -977,46 +977,46 @@ cmd_install() {
     if [ "$FANCY" = "1" ]; then
       ui_intro "$NAME"
     else
-      echo "Configuración de $NAME. Enter conserva el valor entre corchetes." >/dev/tty
+      echo "$NAME setup. Enter keeps the value in brackets." >/dev/tty
       echo >/dev/tty
     fi
 
-    # Cuenta: sólo se pregunta si gh tiene más de una en github.com.
+    # Account: only asked if gh has more than one on github.com.
     local accounts=() login
     while IFS= read -r login; do [ -n "$login" ] && accounts+=("$login"); done < <(list_accounts)
-    [ ${#accounts[@]} -gt 0 ] || die "gh no tiene sesión en github.com; corré gh auth login"
+    [ ${#accounts[@]} -gt 0 ] || die "gh has no session on github.com; run gh auth login"
     if [ ${#accounts[@]} -eq 1 ]; then
       GH_USER="${accounts[0]}"
-      if [ "$FANCY" = "1" ]; then ui_done "Cuenta" "$GH_USER"; else echo "Cuenta: $GH_USER" >/dev/tty; fi
+      if [ "$FANCY" = "1" ]; then ui_done "Account" "$GH_USER"; else echo "Account: $GH_USER" >/dev/tty; fi
     else
       [ -n "$GH_USER" ] || GH_USER=$(active_account)
-      choose_one GH_USER "¿Con qué cuenta de GitHub?" "${accounts[@]}"
+      choose_one GH_USER "Which GitHub account?" "${accounts[@]}"
     fi
     require_session
     use_account
 
-    # Orgs: sólo se pregunta si la cuenta pertenece a alguna; la opción personal va siempre al lado.
+    # Orgs: only asked if the account belongs to any; the personal option always sits next to them.
     local orgs=() org orgs_out
-    orgs_out=$(list_orgs) || gh_fail "no pude listar tus orgs en GitHub"
+    orgs_out=$(list_orgs) || gh_fail "could not list your GitHub orgs"
     while IFS= read -r org; do [ -n "$org" ] && orgs+=("$org"); done <<<"$orgs_out"
     if [ ${#orgs[@]} -eq 0 ]; then
       OWNERS=""
       if [ "$FANCY" = "1" ]; then
-        ui_done "Orgs" "no pertenecés a ninguna, se vigilan todos tus PRs"
+        ui_done "Orgs" "you don't belong to any, watching all your PRs"
       else
-        echo "Orgs: no pertenecés a ninguna, se vigilan todos tus PRs." >/dev/tty
+        echo "Orgs: you don't belong to any, watching all your PRs." >/dev/tty
       fi
     else
       [ "$had_config" = "1" ] || OWNERS="${orgs[*]}"
       local owner_items=()
       for org in "${orgs[@]}"; do owner_items+=("$org|"); done
-      owner_items+=("$GH_USER| (tus repos personales)")
-      choose_many OWNERS "¿Qué PRs vigilar?" "todos tus PRs, en cualquier repo" "${owner_items[@]}"
+      owner_items+=("$GH_USER| (your personal repos)")
+      choose_many OWNERS "Which PRs to watch?" "all your PRs, in any repo" "${owner_items[@]}"
     fi
 
-    # Repos: los que tienen PRs tuyos (abiertos o recientes) dentro de lo elegido; sin opción real, no se pregunta.
+    # Repos: those with your PRs (open or recent) within the selection; with no real choice, not asked.
     local repos=() repo repos_out
-    repos_out=$(list_pr_repos "$OWNERS") || gh_fail "no pude listar los repos con PRs tuyos"
+    repos_out=$(list_pr_repos "$OWNERS") || gh_fail "could not list the repos with your PRs"
     while IFS= read -r repo; do [ -n "$repo" ] && repos+=("$repo"); done <<<"$repos_out"
     local kept="" r all_repos=""
     [ ${#repos[@]} -gt 0 ] && all_repos=" ${repos[*]} "
@@ -1027,11 +1027,11 @@ cmd_install() {
     if [ ${#repos[@]} -gt 1 ]; then
       local repo_items=()
       for repo in "${repos[@]}"; do repo_items+=("$repo|"); done
-      choose_many REPOS "¿Sólo algunos repos? (los que tienen PRs tuyos)" "todos los repos de lo elegido" "${repo_items[@]}"
+      choose_many REPOS "Only some repos? (the ones with your PRs)" "all repos in the selection" "${repo_items[@]}"
     fi
     [ "$FANCY" = "1" ] || echo >/dev/tty
 
-    # Frecuencia: una lista de las que reparten parejo el día, más la actual si la config trae otra.
+    # Frequency: a list of the ones that split the day evenly, plus the current one if the config has another.
     local hour_items=() h
     for h in 1 2 3 4 6 8 12 24; do hour_items+=("$h|$(hours_label "$h")"); done
     case " 1 2 3 4 6 8 12 24 " in
@@ -1039,16 +1039,16 @@ cmd_install() {
       *) valid_hours "$EVERY_HOURS" && hour_items+=("$EVERY_HOURS|$(hours_label "$EVERY_HOURS")") ;;
     esac
     valid_hours "$EVERY_HOURS" || EVERY_HOURS=6
-    choose_one EVERY_HOURS "¿Cada cuántas horas?" "${hour_items[@]}"
-    ask_bool INCLUDE_DRAFTS "¿Actualizar también los drafts?"
+    choose_one EVERY_HOURS "How often?" "${hour_items[@]}"
+    ask_bool INCLUDE_DRAFTS "Update drafts too?"
     local use_skip_label=false
     [ -n "$SKIP_LABEL" ] && use_skip_label=true
-    ask_bool use_skip_label "¿Excluir los PRs con la etiqueta ${SKIP_LABEL:-no-autoupdate}?"
+    ask_bool use_skip_label "Exclude PRs labeled ${SKIP_LABEL:-no-autoupdate}?"
     if [ "$use_skip_label" = "true" ]; then SKIP_LABEL="${SKIP_LABEL:-no-autoupdate}"; else SKIP_LABEL=""; fi
     local go=true
-    ask_bool go "¿Instalar con esta config?"
+    ask_bool go "Install with this config?"
     if [ "$go" != "true" ]; then
-      if [ "$FANCY" = "1" ]; then ui_outro "Cancelado, no se tocó nada."; else echo "Cancelado, no se tocó nada." >/dev/tty; fi
+      if [ "$FANCY" = "1" ]; then ui_outro "Cancelled, nothing was changed."; else echo "Cancelled, nothing was changed." >/dev/tty; fi
       return 0
     fi
     [ "$FANCY" = "1" ] || echo >/dev/tty
@@ -1057,17 +1057,17 @@ cmd_install() {
   check_targets
 
   if [ "$dry_run" = "1" ]; then
-    [ "$FANCY" = "1" ] && ui_outro "dry-run: no se escribió nada, esto es lo que quedaría"
-    echo "# (dry-run) config que se escribiría en $CONFIG"
+    [ "$FANCY" = "1" ] && ui_outro "dry-run: nothing was written, this is what you'd get"
+    echo "# (dry-run) config that would be written to $CONFIG"
     local k
     for k in $CONFIG_KEYS; do echo "$k=${!k}"; done
   else
     write_config
-    report "Config guardada en $CONFIG"
+    report "Config saved to $CONFIG"
   fi
 
   local gh_bin
-  gh_bin=$(command -v gh) || die "falta gh, la CLI de GitHub (brew install gh)"
+  gh_bin=$(command -v gh) || die "gh, the GitHub CLI, is missing (brew install gh)"
 
   case "$(uname -s)" in
     Darwin)
@@ -1075,36 +1075,36 @@ cmd_install() {
       others=$(other_agents)
       if [ -n "$others" ]; then
         if [ "$FANCY" = "1" ] && [ "$dry_run" = "0" ]; then
-          report "Aviso: hay otro LaunchAgent que actualiza PRs cargado ($others); los dos van a actualizar y avisar."
+          report "Warning: another PR-updating LaunchAgent is loaded ($others); both will update and notify."
         else
-          echo "Aviso: hay otro LaunchAgent que actualiza PRs cargado ($others); los dos van a actualizar y avisar." >&2
+          echo "Warning: another PR-updating LaunchAgent is loaded ($others); both will update and notify." >&2
         fi
       fi
       if [ "$dry_run" = "1" ]; then
         echo
-        echo "# (dry-run) LaunchAgent que se escribiría en $PLIST"
+        echo "# (dry-run) LaunchAgent that would be written to $PLIST"
         plist_xml "$gh_bin" "$(schedule_path)"
         return 0
       fi
       mkdir -p "$STATE_DIR" "$(dirname "$PLIST")"
       plist_xml "$gh_bin" "$(schedule_path)" >"$PLIST"
       launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-      launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap falló"
-      report "Programado $(hours_label "$EVERY_HOURS") (launchd, $LABEL)."
+      launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap failed"
+      report "Scheduled $(hours_label "$EVERY_HOURS") (launchd, $LABEL)."
       command -v terminal-notifier >/dev/null \
-        || report "Aviso: sin terminal-notifier las notificaciones no abren el PR al hacer click (brew install terminal-notifier)."
+        || report "Warning: without terminal-notifier, clicking a notification doesn't open the PR (brew install terminal-notifier)."
       if [ "$FANCY" = "1" ]; then
-        ui_outro "Probalo sin tocar nada: gh pr-watcher run --dry-run"
+        ui_outro "Try it without changing anything: gh pr-watcher run --dry-run"
       else
-        echo "Probalo sin tocar nada: gh pr-watcher run --dry-run"
+        echo "Try it without changing anything: gh pr-watcher run --dry-run"
       fi
       ;;
     *)
-      [ "$FANCY" = "1" ] && [ "$dry_run" = "0" ] && ui_outro "Falta programarlo a mano:"
+      [ "$FANCY" = "1" ] && [ "$dry_run" = "0" ] && ui_outro "You still need to schedule it by hand:"
       local hours_csv
       hours_csv=$(schedule_hours | tr ' ' ',')
       echo
-      echo "En este sistema no hay launchd. Agregá esta línea con \`crontab -e\`:"
+      echo "This system has no launchd. Add this line with \`crontab -e\`:"
       echo
       echo "0 $hours_csv * * * $gh_bin pr-watcher run >>$STATE_DIR/cron.log 2>&1"
       ;;
@@ -1115,11 +1115,11 @@ cmd_uninstall() {
   if [ "$(uname -s)" = "Darwin" ]; then
     launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
     rm -f "$PLIST"
-    echo "LaunchAgent quitado. Config ($CONFIG) y log ($STATE_DIR) quedan; borralos a mano si querés."
+    echo "LaunchAgent removed. Config ($CONFIG) and log ($STATE_DIR) stay; delete them by hand if you want."
   else
-    echo "Sacá la línea de pr-watcher con \`crontab -e\`."
+    echo "Remove the pr-watcher line with \`crontab -e\`."
   fi
-  echo "Para quitar la extensión: gh extension remove pr-watcher"
+  echo "To remove the extension: gh extension remove pr-watcher"
 }
 
 cmd_status() {
@@ -1152,73 +1152,73 @@ cmd_status() {
   echo "$NAME $VERSION"
   echo
   if [ -f "$LAST_ERROR" ]; then
-    echo "La última vuelta falló: $(cat "$LAST_ERROR")"
-    echo "  (se limpia sola cuando una vuelta termina bien; diagnóstico: gh pr-watcher doctor)"
+    echo "The last run failed: $(cat "$LAST_ERROR")"
+    echo "  (clears itself when a run succeeds; diagnose: gh pr-watcher doctor)"
     echo
   fi
-  [ -s "$LAST_RUN" ] && { echo "Última vuelta: $(fmt_epoch "$(cat "$LAST_RUN")")"; echo; }
+  [ -s "$LAST_RUN" ] && { echo "Last run: $(fmt_epoch "$(cat "$LAST_RUN")")"; echo; }
   if [ -f "$CONFIG" ]; then
     echo "Config ($CONFIG):"
     local k
-    for k in $CONFIG_KEYS; do printf '  %-16s %s\n' "$k" "${!k:-(vacío)}"; done
+    for k in $CONFIG_KEYS; do printf '  %-16s %s\n' "$k" "${!k:-(empty)}"; done
   else
-    echo "Sin config todavía: gh pr-watcher install"
+    echo "No config yet: gh pr-watcher install"
   fi
   echo
   if [ "$(uname -s)" = "Darwin" ]; then
     if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-      echo "Agente: cargado ($LABEL), corre cada $EVERY_HOURS horas ($(schedule_hours) hs)"
+      echo "Agent: loaded ($LABEL), runs every $EVERY_HOURS h (at $(schedule_hours) h)"
     else
-      echo "Agente: no cargado"
+      echo "Agent: not loaded"
     fi
   fi
   if [ -f "$LOG" ]; then
     echo
-    echo "Últimas líneas del log:"
+    echo "Last log lines:"
     tail -10 "$LOG" | sed 's/^/  /'
   fi
 }
 
 cmd_config() {
   echo "$CONFIG"
-  [ -f "$CONFIG" ] && { echo; cat "$CONFIG"; } || echo "(no existe todavía: gh pr-watcher install)"
+  [ -f "$CONFIG" ] && { echo; cat "$CONFIG"; } || echo "(doesn't exist yet: gh pr-watcher install)"
 }
 
 cmd_log() {
   local n="${1:-30}"
-  [[ "$n" =~ ^[0-9]+$ ]] || die "log espera una cantidad de líneas (por ejemplo: gh pr-watcher log 50)"
-  [ -f "$LOG" ] || die "todavía no hay log ($LOG)"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "log expects a number of lines (e.g. gh pr-watcher log 50)"
+  [ -f "$LOG" ] || die "no log yet ($LOG)"
   tail -n "$n" "$LOG"
 }
 
 cmd_test_notify() {
   load_config
   validate_config
-  local img="${NOTIFY_IMAGE:-$DEFAULT_IMAGE}" via="osascript (sin click ni imagen)"
+  local img="${NOTIFY_IMAGE:-$DEFAULT_IMAGE}" via="osascript (no click or image)"
   command -v terminal-notifier >/dev/null && via="terminal-notifier"
   command -v terminal-notifier >/dev/null || command -v osascript >/dev/null \
-    || command -v notify-send >/dev/null || die "no hay con qué notificar (brew install terminal-notifier)"
-  notify "prueba" "Así se ve el aviso de un PR en conflicto." "https://github.com/pulls" "test"
-  echo "Notificación enviada por $via."
-  [ "$via" = "terminal-notifier" ] && { [ -r "$img" ] && echo "Imagen: $img" || echo "Sin imagen: no encuentro $img"; }
-  echo "Si no aparece, revisá Configuración del Sistema → Notificaciones → ${via%% *}."
+    || command -v notify-send >/dev/null || die "nothing to send notifications with (brew install terminal-notifier)"
+  notify "test" "This is what a conflicted PR notification looks like." "https://github.com/pulls" "test"
+  echo "Notification sent via $via."
+  [ "$via" = "terminal-notifier" ] && { [ -r "$img" ] && echo "Image: $img" || echo "No image: can't find $img"; }
+  echo "If it doesn't show up, check System Settings → Notifications → ${via%% *}."
 }
 
 fmt_epoch() { date -r "$1" '+%F %H:%M' 2>/dev/null || date -d "@$1" '+%F %H:%M'; }
 
-# Segundos de un sysctl de macOS con forma "{ sec = N, usec = ... }"; 0 si no existe.
+# Seconds from a macOS sysctl shaped like "{ sec = N, usec = ... }"; 0 if it doesn't exist.
 sysctl_sec() { sysctl -n "$1" 2>/dev/null | sed -nE 's/^\{ sec = ([0-9]+).*/\1/p' | grep . || echo 0; }
 
 plist_hours() { plutil -extract StartCalendarInterval json -o - "$PLIST" 2>/dev/null | jq -r 'map(.Hour) | join(" ")'; }
 
-# Resultado de un chequeo de doctor: ok, warn o fail, con el arreglo si hay uno.
+# Result of a doctor check: ok, warn or fail, with the fix if there is one.
 DOCTOR_CHECKS=""
 check() { # status id message [fix]
   DOCTOR_CHECKS+=$(jq -cn --arg s "$1" --arg i "$2" --arg m "$3" --arg f "${4:-}" \
     '{id: $i, status: $s, message: $m, fix: (if $f == "" then null else $f end)}')$'\n'
 }
 
-# Corre en un subshell una función que corta con die; el motivo queda en PROBE_MSG y doctor sigue.
+# Runs a function that stops with die in a subshell; the reason lands in PROBE_MSG and doctor carries on.
 PROBE_MSG=""
 probe() {
   local out rc
@@ -1228,8 +1228,8 @@ probe() {
   return $rc
 }
 
-# Si launchd disparó la última hora programada. Sólo cuenta si la máquina estaba prendida a esa
-# hora: dormida, launchd corre al despertar; apagada, esa vuelta se pierde y no es una falla.
+# Whether launchd fired the last scheduled hour. Only counts if the machine was on at that
+# hour: asleep, launchd runs on wake; powered off, that run is lost and it's not a failure.
 check_last_run() {
   local hours now now_h h slot=0 slot_at last boot wake installed expected
   hours=$(plist_hours)
@@ -1244,17 +1244,17 @@ check_last_run() {
   wake=$(sysctl_sec kern.waketime)
   installed=$(stat -f %m "$PLIST" 2>/dev/null || echo 0)
   if [ "$last" -ge "$slot_at" ]; then
-    check ok last_run "última vuelta: $(fmt_epoch "$last")"
+    check ok last_run "last run: $(fmt_epoch "$last")"
   elif [ "$installed" -gt "$slot_at" ] || [ "$boot" -gt "$slot_at" ]; then
-    check ok last_run "todavía no le tocó correr (próximas: $hours hs)"
+    check ok last_run "not due to run yet (next: $hours h)"
   else
     expected=$slot_at
     [ "$wake" -gt "$expected" ] && expected=$wake
     if [ $((now - expected)) -gt 900 ]; then
-      check fail last_run "tenía que correr a las $(fmt_epoch "$expected") y no corrió (última: $([ "$last" -gt 0 ] && fmt_epoch "$last" || echo nunca))" \
-        "revisá launchctl print gui/$(id -u)/$LABEL y $STATE_DIR/launchd.err.log; después gh pr-watcher install --yes"
+      check fail last_run "should have run at $(fmt_epoch "$expected") and didn't (last: $([ "$last" -gt 0 ] && fmt_epoch "$last" || echo never))" \
+        "check launchctl print gui/$(id -u)/$LABEL and $STATE_DIR/launchd.err.log; then gh pr-watcher install --yes"
     else
-      check ok last_run "le toca correr ahora (a las $(printf %02d "$slot"):00)"
+      check ok last_run "due to run now (at $(printf %02d "$slot"):00)"
     fi
   fi
 }
@@ -1264,20 +1264,20 @@ cmd_doctor() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --json) json=1 ;;
-      *) die "opción desconocida para doctor: $1" ;;
+      *) die "unknown option for doctor: $1" ;;
     esac
     shift
   done
   if ! command -v jq >/dev/null; then
     if [ "$json" = "1" ]; then
-      printf '{"ok":false,"checks":[{"id":"jq","status":"fail","message":"falta jq","fix":"brew install jq"}]}\n'
+      printf '{"ok":false,"checks":[{"id":"jq","status":"fail","message":"jq is missing","fix":"brew install jq"}]}\n'
     else
-      printf '✗ falta jq\n    → brew install jq\n'
+      printf '✗ jq is missing\n    → brew install jq\n'
     fi
     exit 1
   fi
 
-  # Dependencias.
+  # Dependencies.
   local gh_ok=0
   if probe require_gh; then
     gh_ok=1
@@ -1287,89 +1287,89 @@ cmd_doctor() {
   fi
   check ok jq "$(jq --version)"
   if [ "$(uname -s)" = "Darwin" ] && ! command -v terminal-notifier >/dev/null; then
-    check warn notifier "sin terminal-notifier: los avisos no abren el PR al hacer click ni llevan imagen" "brew install terminal-notifier"
+    check warn notifier "no terminal-notifier: notifications don't open the PR on click and carry no image" "brew install terminal-notifier"
   fi
 
-  # Config: los avisos de load_config salen como warn; después, la validación.
+  # Config: load_config warnings come out as warn; then, the validation.
   local config_ok=0 line
   if [ -f "$CONFIG" ]; then
     while IFS= read -r line; do
-      [ -n "$line" ] && check warn config_syntax "${line#aviso: }" "corregí la línea en $CONFIG"
+      [ -n "$line" ] && check warn config_syntax "${line#warning: }" "fix the line in $CONFIG"
     done < <( ( load_config ) 2>&1 )
     load_config 2>/dev/null
     if probe validate_config; then
       config_ok=1
-      check ok config "config válida ($CONFIG)"
+      check ok config "valid config ($CONFIG)"
     else
-      check fail config "$PROBE_MSG" "corregilo en $CONFIG o con gh pr-watcher install"
+      check fail config "$PROBE_MSG" "fix it in $CONFIG or with gh pr-watcher install"
     fi
   else
-    check fail config "no hay config todavía" "gh pr-watcher install"
+    check fail config "no config yet" "gh pr-watcher install"
   fi
 
-  # Sesión, cuenta y acceso a lo que se vigila.
+  # Session, account and access to what's watched.
   if [ "$gh_ok" = "1" ]; then
     if probe require_session && probe use_account; then
       use_account
       local who="${GH_USER:-$(active_account)}"
-      check ok session "sesión de gh como '$who', con permiso repo"
+      check ok session "gh session as '$who', with the repo scope"
       if [ "$config_ok" = "1" ]; then
         if probe check_targets; then
           local targets="${REPOS:-$OWNERS}"
-          if [ -n "$targets" ]; then check ok targets "accesibles: $targets"; else check ok targets "sin filtro: todos tus PRs abiertos"; fi
+          if [ -n "$targets" ]; then check ok targets "accessible: $targets"; else check ok targets "no filter: all your open PRs"; fi
         else
-          check fail targets "$PROBE_MSG" "corregí OWNERS/REPOS; gh pr-watcher detect lista lo que ve tu cuenta"
+          check fail targets "$PROBE_MSG" "fix OWNERS/REPOS; gh pr-watcher detect lists what your account can see"
         fi
       fi
     else
       case "$PROBE_MSG" in
-        "no pude conectar"*) check fail session "$PROBE_MSG" "revisá la conexión (o el proxy) y volvé a correr doctor" ;;
+        "could not connect"*) check fail session "$PROBE_MSG" "check the connection (or the proxy) and run doctor again" ;;
         *) check fail session "$PROBE_MSG" ;;
       esac
     fi
   fi
 
-  # Programación.
+  # Schedule.
   if [ "$(uname -s)" = "Darwin" ]; then
     if [ ! -f "$PLIST" ]; then
-      check fail agent "no está programado" "gh pr-watcher install"
+      check fail agent "not scheduled" "gh pr-watcher install"
     elif ! agent_loaded; then
-      check fail agent "el LaunchAgent existe pero no está cargado" "gh pr-watcher install --yes"
+      check fail agent "the LaunchAgent exists but isn't loaded" "gh pr-watcher install --yes"
     else
       local plist_gh plist_h
       plist_gh=$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null)
       plist_h=$(plist_hours)
       if [ ! -x "$plist_gh" ]; then
-        check fail agent "el LaunchAgent apunta a un gh que ya no está ($plist_gh)" "gh pr-watcher install --yes"
+        check fail agent "the LaunchAgent points to a gh that no longer exists ($plist_gh)" "gh pr-watcher install --yes"
       elif [ "$config_ok" = "1" ] && [ "$plist_h" != "$(schedule_hours)" ]; then
-        check fail agent "programado a las $plist_h hs, pero EVERY_HOURS=$EVERY_HOURS dice $(schedule_hours) hs" "gh pr-watcher install --yes"
+        check fail agent "scheduled at $plist_h h, but EVERY_HOURS=$EVERY_HOURS means $(schedule_hours) h" "gh pr-watcher install --yes"
       else
-        check ok agent "programado a las $plist_h hs ($LABEL)"
+        check ok agent "scheduled at $plist_h h ($LABEL)"
       fi
       check_last_run
     fi
     local other
     while IFS= read -r other; do
-      [ -n "$other" ] && check fail others "hay otro agente que actualiza PRs corriendo ($other): los dos actualizan y avisan" \
-        "si este lo reemplaza: launchctl bootout gui/$(id -u)/$other y borrá su plist de ~/Library/LaunchAgents (si no, vuelve en el próximo login)"
+      [ -n "$other" ] && check fail others "another PR-updating agent is running ($other): both update and notify" \
+        "if this one replaces it: launchctl bootout gui/$(id -u)/$other and delete its plist from ~/Library/LaunchAgents (otherwise it comes back at the next login)"
     done < <(other_agents)
   else
-    check warn agent "sin launchd: doctor no revisa la programación" "crontab -l | grep pr-watcher"
+    check warn agent "no launchd: doctor doesn't check the schedule" "crontab -l | grep pr-watcher"
   fi
 
-  # Rastros de las vueltas anteriores.
+  # Traces of previous runs.
   if [ -s "$LAST_ERROR" ]; then
-    check fail last_error "la última vuelta falló: $(cat "$LAST_ERROR")" \
-      "arreglá lo de arriba y probá con gh pr-watcher run; el error se borra cuando una vuelta anda"
+    check fail last_error "the last run failed: $(cat "$LAST_ERROR")" \
+      "fix the issues above and try gh pr-watcher run; the error clears once a run succeeds"
   fi
   if [ -s "$STATE" ] && ! jq -e 'type == "object"' "$STATE" >/dev/null 2>&1; then
-    check warn state "el estado está dañado: la próxima vuelta lo descarta y vuelve a avisar los conflictos abiertos"
+    check warn state "the state is corrupted: the next run discards it and notifies the open conflicts again"
   fi
   if [ -d "$LOCK_DIR" ]; then
     local pid
     pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
-      check warn lock "una vuelta lleva más de 1 h corriendo (pid $pid)" "kill $pid"
+      check warn lock "a run has been going for over 1 h (pid $pid)" "kill $pid"
     fi
   fi
 
@@ -1384,23 +1384,23 @@ cmd_doctor() {
     echo
     local fails
     fails=$(jq '[.[] | select(.status == "fail")] | length' <<<"$checks")
-    if [ "$ok" = "true" ]; then echo "Todo en orden."; else echo "$fails problema(s) para resolver."; fi
+    if [ "$ok" = "true" ]; then echo "All good."; else echo "$fails problem(s) to fix."; fi
   fi
   [ "$ok" = "true" ]
 }
 
-# Un typo de una letra (rub, stauts) o un prefijo (inst) sugiere el comando real.
+# A one-letter typo (rub, stauts) or a prefix (inst) suggests the real command.
 suggest_command() {
   local typed="$1" c i diff
   for c in run install uninstall status detect doctor config log test-notify version help; do
-    if [[ "$c" == "$typed"* ]] && [ ${#typed} -ge 2 ]; then printf ' (¿quisiste decir %s?)' "$c"; return 0; fi
+    if [[ "$c" == "$typed"* ]] && [ ${#typed} -ge 2 ]; then printf ' (did you mean %s?)' "$c"; return 0; fi
     [ ${#c} -eq ${#typed} ] || continue
     diff=0
     for ((i = 0; i < ${#c}; i++)); do [ "${c:i:1}" = "${typed:i:1}" ] || diff=$((diff + 1)); done
-    if [ "$diff" -le 1 ]; then printf ' (¿quisiste decir %s?)' "$c"; return 0; fi
-    # Dos letras vecinas invertidas.
+    if [ "$diff" -le 1 ]; then printf ' (did you mean %s?)' "$c"; return 0; fi
+    # Two adjacent letters swapped.
     for ((i = 0; i < ${#c} - 1; i++)); do
-      if [ "${typed:0:i}${typed:i+1:1}${typed:i:1}${typed:i+2}" = "$c" ]; then printf ' (¿quisiste decir %s?)' "$c"; return 0; fi
+      if [ "${typed:0:i}${typed:i+1:1}${typed:i:1}${typed:i+2}" = "$c" ]; then printf ' (did you mean %s?)' "$c"; return 0; fi
     done
   done
 }
@@ -1422,7 +1422,7 @@ main() {
     doctor) cmd_doctor "$@" ;;
     version|--version|-v) echo "$NAME $VERSION" ;;
     help|--help|-h) usage ;;
-    *) die "comando desconocido: $cmd$(suggest_command "$cmd") (gh pr-watcher help lista los comandos)" ;;
+    *) die "unknown command: $cmd$(suggest_command "$cmd") (gh pr-watcher help lists the commands)" ;;
   esac
 }
 
