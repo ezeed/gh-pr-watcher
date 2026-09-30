@@ -16,6 +16,7 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LAST_ERROR="$STATE_DIR/last_error"
 LAST_RUN="$STATE_DIR/last_run"
 LOCK_DIR="$STATE_DIR/run.lock"
+LOG_MAX_LINES=2000
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_IMAGE="$SELF_DIR/assets/icon.png"
 
@@ -160,9 +161,25 @@ require_session() {
   fi
 }
 
+# Echoes only to a terminal or a pipe: under launchd stdout is launchd.out.log and would duplicate the log.
 log() {
   mkdir -p "$STATE_DIR"
-  printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"
+  if [ -t 1 ] || [ -p /dev/stdout ]; then
+    printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"
+  else
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+  fi
+}
+
+# Keeps each log at its last LOG_MAX_LINES lines, rewritten in place: launchd holds the files open.
+trim_logs() {
+  local f
+  for f in "$LOG" "$STATE_DIR/launchd.out.log" "$STATE_DIR/launchd.err.log"; do
+    [ -f "$f" ] || continue
+    [ "$(wc -l <"$f")" -gt "$LOG_MAX_LINES" ] || continue
+    tail -n "$LOG_MAX_LINES" "$f" >"$f.tmp.$$" && cat "$f.tmp.$$" >"$f"
+    rm -f "$f.tmp.$$"
+  done
 }
 
 # Reads KEY=VALUE without executing the file; ignores comments and unknown keys.
@@ -308,6 +325,7 @@ cmd_run() {
     log "a run is already in progress (pid $(cat "$LOCK_DIR/pid" 2>/dev/null)), skipping this one"
     return 0
   fi
+  [ "$IN_RUN" = "1" ] && trim_logs
 
   local old_state='{}'
   if [ -s "$STATE" ]; then

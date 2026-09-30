@@ -79,7 +79,8 @@ avisa, con una sugerencia si se parece a una clave real. `install` además verif
 y cada repo existan y que tu cuenta los vea.
 
 El log y el estado quedan en `~/.local/state/gh-pr-watcher/`. El estado solo sirve para no repetir
-avisos: borrarlo es inocuo.
+avisos: borrarlo es inocuo. Cada log guarda sus últimas 2000 líneas (más o menos un mes con
+algunos PRs abiertos); las anteriores se descartan en cada vuelta.
 
 ## Comandos
 

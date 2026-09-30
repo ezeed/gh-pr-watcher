@@ -79,7 +79,8 @@ warning, with a suggestion if it looks like a real key. `install` also checks th
 repo exists and that your account can see it.
 
 The log and state live in `~/.local/state/gh-pr-watcher/`. The state only prevents repeated
-notifications: deleting it is harmless.
+notifications: deleting it is harmless. Each log keeps its last 2000 lines (about a month with a
+few open PRs); older ones are dropped on each run.
 
 ## Commands
 
