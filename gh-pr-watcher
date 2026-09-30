@@ -13,6 +13,7 @@ CONFIG="$CONFIG_DIR/config"
 STATE="$STATE_DIR/state.json"
 CONFLICTS="$STATE_DIR/conflicts.json"
 CONFLICTS_PAGE="$STATE_DIR/conflicts.html"
+REMINDED="$STATE_DIR/conflicts_reminded.json"
 LOG="$STATE_DIR/watcher.log"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LAST_ERROR="$STATE_DIR/last_error"
@@ -22,13 +23,20 @@ LOG_MAX_LINES=2000
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_IMAGE="$SELF_DIR/assets/icon.png"
 
-CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_HOURS INCLUDE_DRAFTS SKIP_LABEL NOTIFY_IMAGE"
+CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_MINUTES INCLUDE_DRAFTS SKIP_LABEL NOTIFY_IMAGE"
+# Read from older configs and converted to EVERY_MINUTES; never written.
+LEGACY_KEYS="EVERY_HOURS"
+EVERY_OPTIONS="15 30 60 120 180"
+# Conflicts already notified are reminded at most this often, whatever the frequency.
+REMIND_EVERY_SEC=3300
 
 # Defaults; the config file overrides them.
 GH_USER=""
 OWNERS=""
 REPOS=""
-EVERY_HOURS="6"
+EVERY_MINUTES="60"
+EVERY_HOURS=""
+LEGACY_EVERY=0
 INCLUDE_DRAFTS="false"
 SKIP_LABEL=""
 NOTIFY_IMAGE=""
@@ -52,7 +60,8 @@ Commands:
     --user LOGIN            gh account to use.
     --owners "A B"          Orgs or users to watch ("" = all your PRs).
     --repos "o/r o/r"       Only these repos (replaces --owners).
-    --every-hours N         Run every N hours (1-24, starting at 0:00).
+    --every 15m|30m|1h|2h|3h
+                            How often it runs, starting at 0:00.
     --drafts | --no-drafts  Update drafts or not.
     --skip-label L | --no-skip-label
                             Exclude PRs with label L.
@@ -125,7 +134,23 @@ gh_fail() {
   die "$what: ${err:-no details from gh}"
 }
 
-valid_hours() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 24 ]; }
+# An older config keeps its EVERY_HOURS schedule until the next install.
+valid_config_every() {
+  offered_every "$EVERY_MINUTES" && return 0
+  [ "$LEGACY_EVERY" = "1" ] && [ "$EVERY_MINUTES" -ge 60 ] && [ "$EVERY_MINUTES" -le 1440 ]
+}
+
+offered_every() { case " $EVERY_OPTIONS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# Minutes out of --every: "15m", "2h" or a bare number of minutes; empty if it isn't one.
+parse_every() {
+  case "$1" in
+    *[!0-9mh]*|"") ;;
+    *m) [[ "${1%m}" =~ ^[0-9]+$ ]] && echo $((10#${1%m})) ;;
+    *h) [[ "${1%h}" =~ ^[0-9]+$ ]] && echo $((10#${1%h} * 60)) ;;
+    *) [[ "$1" =~ ^[0-9]+$ ]] && echo $((10#$1)) ;;
+  esac
+}
 
 # No pipe to grep -q: it stops reading, gh gets SIGPIPE and pipefail counts it as failed.
 gh_supports_json() {
@@ -200,9 +225,18 @@ load_config() {
     value="${value#\"}"; value="${value%\"}"
     case " $CONFIG_KEYS " in
       *" $key "*) printf -v "$key" '%s' "$value" ;;
-      *) warn "unknown key in $CONFIG: $key$(suggest_key "$key")" ;;
+      *) case " $LEGACY_KEYS " in *" $key "*) printf -v "$key" '%s' "$value"; continue ;; esac
+         warn "unknown key in $CONFIG: $key$(suggest_key "$key")" ;;
     esac
   done <"$CONFIG"
+  if [ -n "$EVERY_HOURS" ] && ! grep -qE '^[[:space:]]*EVERY_MINUTES[[:space:]]*=' "$CONFIG"; then
+    if [[ "$EVERY_HOURS" =~ ^[0-9]+$ ]] && [ "$EVERY_HOURS" -ge 1 ] && [ "$EVERY_HOURS" -le 24 ]; then
+      EVERY_MINUTES=$((10#$EVERY_HOURS * 60))
+      LEGACY_EVERY=1
+    else
+      EVERY_MINUTES="$EVERY_HOURS"
+    fi
+  fi
 }
 
 suggest_key() {
@@ -220,7 +254,7 @@ write_config() {
   mkdir -p "$CONFIG_DIR"
   cat >"$CONFIG" <<EOF
 # $NAME — read as KEY=VALUE, never executed. Edit it and you're done: the next run picks it up.
-# If you change EVERY_HOURS, run \`gh pr-watcher install --yes\` to reschedule.
+# If you change EVERY_MINUTES, run \`gh pr-watcher install --yes\` to reschedule.
 
 # gh account to use (\`gh auth status\` lists them). Empty = the active account.
 GH_USER=$GH_USER
@@ -231,8 +265,8 @@ OWNERS=$OWNERS
 # Specific owner/repo repos separated by spaces. If any is set, only those are watched and OWNERS is ignored.
 REPOS=$REPOS
 
-# Run every N hours (1-24), counting from 0:00: 6 = 0:00, 6:00, 12:00 and 18:00.
-EVERY_HOURS=$EVERY_HOURS
+# How often it runs, in minutes, counting from 0:00: 15, 30, 60, 120 or 180.
+EVERY_MINUTES=$EVERY_MINUTES
 
 # true = also update drafts.
 INCLUDE_DRAFTS=$INCLUDE_DRAFTS
@@ -246,7 +280,7 @@ EOF
 }
 
 validate_config() {
-  valid_hours "$EVERY_HOURS" || die "EVERY_HOURS must be a number from 1 to 24 (got '$EVERY_HOURS')"
+  valid_config_every || die "EVERY_MINUTES must be one of $EVERY_OPTIONS (got '$EVERY_MINUTES')"
   case "$OWNERS" in *,*) die "OWNERS must be separated by spaces, not commas (got '$OWNERS')" ;; esac
   case "$REPOS" in *,*) die "REPOS must be separated by spaces, not commas (got '$REPOS')" ;; esac
   local ow
@@ -330,17 +364,27 @@ write_conflicts_page() { # conflicts_json
     "<p>Updated \($now) by gh pr-watcher.</p></body></html>"' <<<"$1"
 }
 
-# One notification for every open conflict, repeated each run while they last;
-# the shared group makes each one replace the previous banner.
+# One notification for every open conflict, repeated while they last but at most every
+# REMIND_EVERY_SEC unless one is new or the list changed; the shared group replaces the banner.
 notify_conflicts() { # conflicts_json dry_run
-  local n new first subtitle message url
+  local n new first subtitle message url keys last_at=0 last_keys=""
   n=$(jq length <<<"$1")
   if [ "$n" = "0" ]; then
+    [ "$2" = "0" ] && rm -f "$REMINDED"
     [ "$2" = "0" ] && command -v terminal-notifier >/dev/null \
       && terminal-notifier -remove "$NAME-conflicts" >/dev/null 2>&1
     return 0
   fi
   new=$(jq --argjson now "$now" '[.[] | select(.since == $now)] | length' <<<"$1")
+  keys=$(jq -r '[.[].key] | sort | join(" ")' <<<"$1")
+  if [ -s "$REMINDED" ]; then
+    last_at=$(jq -r '.at // 0' "$REMINDED" 2>/dev/null) || last_at=0
+    last_keys=$(jq -r '.keys // ""' "$REMINDED" 2>/dev/null) || last_keys=""
+  fi
+  if [ "$new" = "0" ] && [ "$keys" = "$last_keys" ] && [ $((now - last_at)) -lt "$REMIND_EVERY_SEC" ]; then
+    log "$n PR(s) still conflicting, already reminded at $(fmt_epoch "$last_at")"
+    return 0
+  fi
   if [ "$n" = "1" ]; then
     first=$(jq -c '.[0]' <<<"$1")
     url=$(jq -r .url <<<"$first")
@@ -363,6 +407,7 @@ notify_conflicts() { # conflicts_json dry_run
   [ "$n" = "1" ] || write_conflicts_page "$1" >"$CONFLICTS_PAGE"
   log "notifying: $subtitle — $message"
   notify "$subtitle" "$message" "$url" "conflicts"
+  jq -n --argjson at "$now" --arg keys "$keys" '{at: $at, keys: $keys}' >"$REMINDED"
 }
 
 cmd_run() {
@@ -652,7 +697,7 @@ cmd_detect() {
     --argjson repos "$(printf '%s\n' "$repos" | lines_json)" \
     --arg config_path "$CONFIG" --argjson config_exists "$config_exists" \
     --arg GH_USER "$cfg_user" --arg OWNERS "$OWNERS" --arg REPOS "$REPOS" \
-    --arg EVERY_HOURS "$EVERY_HOURS" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
+    --arg EVERY_MINUTES "$EVERY_MINUTES" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
     --arg label "$LABEL" --arg plist "$PLIST" --argjson loaded "$loaded" --argjson plist_exists "$plist_exists" \
     --argjson others "$(other_agents | lines_json)" \
     --argjson errors "$(printf '%s' "$errors" | jq -s .)" \
@@ -674,7 +719,7 @@ cmd_detect() {
         path: $config_path,
         exists: $config_exists,
         values: {GH_USER: $GH_USER, OWNERS: $OWNERS, REPOS: $REPOS,
-                 EVERY_HOURS: ($EVERY_HOURS | tonumber? // $EVERY_HOURS),
+                 EVERY_MINUTES: ($EVERY_MINUTES | tonumber? // $EVERY_MINUTES),
                  INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL}
       },
       installed: {label: $label, plist: $plist, plist_exists: $plist_exists, agent_loaded: $loaded},
@@ -938,30 +983,69 @@ join_hours() {
   if [ -n "$out" ]; then echo "$out and $last"; else echo "$last"; fi
 }
 
-# Label for each frequency option: with few runs, the hours; with many, how many per day.
-hours_label() {
-  local every="$1" h=0 hours="" count=0
-  while [ "$h" -lt 24 ]; do hours="${hours:+$hours }$h:00"; h=$((h + every)); count=$((count + 1)); done
+fmt_slot() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
+
+# Label for each frequency option: with few runs, the times; with many, how many per day.
+every_label() {
+  local every="$1" count times="" m
+  count=$((1440 / every + (1440 % every > 0)))
   case "$every" in
-    1) echo "every hour · 24 runs a day" ;;
-    24) echo "once a day · at 0:00" ;;
-    *) if [ "$count" -le 6 ]; then echo "every $every h · at $(join_hours "$hours")"
-       else echo "every $every h · $count runs a day"; fi ;;
+    60) echo "every hour · 24 runs a day" ;;
+    1440) echo "once a day · at 0:00" ;;
+    *) if [ "$every" -lt 60 ]; then echo "every $every min · $count runs a day"
+       elif [ "$count" -le 6 ]; then
+         for m in $(schedule_slots "$every"); do times="${times:+$times }$(fmt_slot "$m")"; done
+         echo "every $((every / 60)) h · at $(join_hours "$times")"
+       else echo "every $((every / 60)) h · $count runs a day"; fi ;;
   esac
 }
 
-# Run hours: from 0:00, every EVERY_HOURS.
-schedule_hours() {
-  local h=0 hours=""
-  while [ "$h" -lt 24 ]; do
-    hours="${hours:+$hours }$h"
-    h=$((h + EVERY_HOURS))
+# Minutes of the day when it runs: from 0:00, every EVERY_MINUTES (or $1).
+schedule_slots() {
+  local every="${1:-$EVERY_MINUTES}" m=0 slots=""
+  while [ "$m" -lt 1440 ]; do
+    slots="${slots:+$slots }$m"
+    m=$((m + every))
   done
-  echo "$hours"
+  echo "$slots"
+}
+
+# Every run time as h:mm, or the frequency label when there are too many to list.
+schedule_desc() {
+  local slots m out=""
+  slots=$(schedule_slots)
+  if [ "$(wc -w <<<"$slots")" -gt 8 ]; then every_label "$EVERY_MINUTES"; return; fi
+  for m in $slots; do out="${out:+$out }$(fmt_slot "$m")"; done
+  echo "at $(join_hours "$out")"
+}
+
+# Under an hour, the minutes repeat every hour; from one hour on, one entry per run.
+calendar_entries() {
+  local m
+  if [ "$EVERY_MINUTES" -lt 60 ]; then
+    for m in $(schedule_slots); do
+      [ "$m" -lt 60 ] && printf '    <dict><key>Minute</key><integer>%d</integer></dict>\n' "$m"
+    done
+  else
+    for m in $(schedule_slots); do
+      printf '    <dict><key>Hour</key><integer>%d</integer><key>Minute</key><integer>%d</integer></dict>\n' $((m / 60)) $((m % 60))
+    done
+  fi
+}
+
+cron_line() { # gh_bin
+  local hours=""
+  if [ "$EVERY_MINUTES" -lt 60 ]; then
+    printf '*/%d * * * *' "$EVERY_MINUTES"
+  else
+    hours=$(for m in $(schedule_slots); do echo $((m / 60)); done | paste -sd, -)
+    printf '0 %s * * *' "$hours"
+  fi
+  printf ' %s pr-watcher run >>%s/cron.log 2>&1\n' "$1" "$STATE_DIR"
 }
 
 plist_xml() {
-  local gh_bin="$1" path_env="$2" h
+  local gh_bin="$1" path_env="$2"
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -977,9 +1061,7 @@ plist_xml() {
   <key>StartCalendarInterval</key>
   <array>
 EOF
-  for h in $(schedule_hours); do
-    printf '    <dict><key>Hour</key><integer>%d</integer><key>Minute</key><integer>0</integer></dict>\n' "$h"
-  done
+  calendar_entries
   cat <<EOF
   </array>
   <key>EnvironmentVariables</key>
@@ -1008,13 +1090,13 @@ schedule_path() {
 
 cmd_install() {
   local yes=0 dry_run=0 flags=0
-  local f_user="" f_owners="" f_repos="" f_hours="" f_drafts="" f_skip="" f_image=""
-  local set_user=0 set_owners=0 set_repos=0 set_hours=0 set_drafts=0 set_skip=0 set_image=0
+  local f_user="" f_owners="" f_repos="" f_every="" f_drafts="" f_skip="" f_image=""
+  local set_user=0 set_owners=0 set_repos=0 set_every=0 set_drafts=0 set_skip=0 set_image=0
   while [ $# -gt 0 ]; do
     local opt="$1" val=""
     case "$opt" in
       --*=*) val="${opt#*=}"; opt="${opt%%=*}" ;;
-      --user|--owners|--repos|--every-hours|--skip-label|--notify-image)
+      --user|--owners|--repos|--every|--every-hours|--skip-label|--notify-image)
         [ $# -ge 2 ] || die "$opt needs a value"
         val="$2"; shift ;;
     esac
@@ -1024,7 +1106,10 @@ cmd_install() {
       --user) f_user="$val"; set_user=1 ;;
       --owners) f_owners="$val"; set_owners=1 ;;
       --repos) f_repos="$val"; set_repos=1 ;;
-      --every-hours) f_hours="$val"; set_hours=1 ;;
+      --every) f_every=$(parse_every "$val"); set_every=1
+        offered_every "$f_every" || die "--every must be 15m, 30m, 1h, 2h or 3h (got '$val')" ;;
+      --every-hours) f_every=$(parse_every "${val}h"); set_every=1
+        offered_every "$f_every" || die "--every-hours must be 1, 2 or 3; for less than an hour, --every 15m or 30m (got '$val')" ;;
       --drafts) f_drafts=true; set_drafts=1 ;;
       --no-drafts) f_drafts=false; set_drafts=1 ;;
       --skip-label) f_skip="$val"; set_skip=1 ;;
@@ -1034,7 +1119,7 @@ cmd_install() {
     esac
     shift
   done
-  flags=$((set_user + set_owners + set_repos + set_hours + set_drafts + set_skip + set_image))
+  flags=$((set_user + set_owners + set_repos + set_every + set_drafts + set_skip + set_image))
 
   require_jq
   require_gh
@@ -1044,7 +1129,7 @@ cmd_install() {
   [ "$set_user" = "1" ] && GH_USER="$f_user"
   [ "$set_owners" = "1" ] && OWNERS="$f_owners"
   [ "$set_repos" = "1" ] && REPOS="$f_repos"
-  [ "$set_hours" = "1" ] && EVERY_HOURS="$f_hours"
+  [ "$set_every" = "1" ] && { EVERY_MINUTES="$f_every"; LEGACY_EVERY=0; }
   [ "$set_drafts" = "1" ] && INCLUDE_DRAFTS="$f_drafts"
   [ "$set_skip" = "1" ] && SKIP_LABEL="$f_skip"
   [ "$set_image" = "1" ] && NOTIFY_IMAGE="$f_image"
@@ -1120,15 +1205,12 @@ cmd_install() {
     fi
     [ "$FANCY" = "1" ] || echo >/dev/tty
 
-    # Frequency: a list of the ones that split the day evenly, plus the current one if the config has another.
-    local hour_items=() h
-    for h in 1 2 3 4 6 8 12 24; do hour_items+=("$h|$(hours_label "$h")"); done
-    case " 1 2 3 4 6 8 12 24 " in
-      *" $EVERY_HOURS "*) ;;
-      *) valid_hours "$EVERY_HOURS" && hour_items+=("$EVERY_HOURS|$(hours_label "$EVERY_HOURS")") ;;
-    esac
-    valid_hours "$EVERY_HOURS" || EVERY_HOURS=6
-    choose_one EVERY_HOURS "How often?" "${hour_items[@]}"
+    # Frequency: an older config with a longer interval starts from the longest one offered.
+    local every_items=() m
+    for m in $EVERY_OPTIONS; do every_items+=("$m|$(every_label "$m")"); done
+    offered_every "$EVERY_MINUTES" || EVERY_MINUTES=180
+    LEGACY_EVERY=0
+    choose_one EVERY_MINUTES "How often?" "${every_items[@]}"
     ask_bool INCLUDE_DRAFTS "Update drafts too?"
     local use_skip_label=false
     [ -n "$SKIP_LABEL" ] && use_skip_label=true
@@ -1142,6 +1224,8 @@ cmd_install() {
     fi
     [ "$FANCY" = "1" ] || echo >/dev/tty
   fi
+  offered_every "$EVERY_MINUTES" || [ "$LEGACY_EVERY" = "0" ] \
+    || die "EVERY_HOURS=$EVERY_HOURS is no longer offered: pick --every 15m, 30m, 1h, 2h or 3h"
   validate_config
   check_targets
 
@@ -1179,7 +1263,7 @@ cmd_install() {
       plist_xml "$gh_bin" "$(schedule_path)" >"$PLIST"
       launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
       launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap failed"
-      report "Scheduled $(hours_label "$EVERY_HOURS") (launchd, $LABEL)."
+      report "Scheduled $(every_label "$EVERY_MINUTES") (launchd, $LABEL)."
       command -v terminal-notifier >/dev/null \
         || report "Warning: without terminal-notifier, clicking a notification doesn't open the PR (brew install terminal-notifier)."
       if [ "$FANCY" = "1" ]; then
@@ -1190,12 +1274,10 @@ cmd_install() {
       ;;
     *)
       [ "$FANCY" = "1" ] && [ "$dry_run" = "0" ] && ui_outro "You still need to schedule it by hand:"
-      local hours_csv
-      hours_csv=$(schedule_hours | tr ' ' ',')
       echo
       echo "This system has no launchd. Add this line with \`crontab -e\`:"
       echo
-      echo "0 $hours_csv * * * $gh_bin pr-watcher run >>$STATE_DIR/cron.log 2>&1"
+      cron_line "$gh_bin"
       ;;
   esac
 }
@@ -1221,17 +1303,17 @@ cmd_status() {
     [ -s "$STATE" ] && jq -e . "$STATE" >/dev/null 2>&1 && state=$(cat "$STATE")
     jq -n --arg version "$VERSION" --arg config_path "$CONFIG" --argjson config_exists "$config_exists" \
       --arg GH_USER "$GH_USER" --arg OWNERS "$OWNERS" --arg REPOS "$REPOS" \
-      --arg EVERY_HOURS "$EVERY_HOURS" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
-      --argjson loaded "$loaded" --arg hours "$(schedule_hours)" --argjson state "$state" \
+      --arg EVERY_MINUTES "$EVERY_MINUTES" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
+      --argjson loaded "$loaded" --arg slots "$(schedule_slots)" --argjson state "$state" \
       --argjson log "$(tail -20 "$LOG" 2>/dev/null | lines_json)" \
       --arg last_error "$(cat "$LAST_ERROR" 2>/dev/null)" --arg last_run "$(cat "$LAST_RUN" 2>/dev/null)" \
       '{version: $version,
         config: {path: $config_path, exists: $config_exists,
                  values: {GH_USER: $GH_USER, OWNERS: $OWNERS, REPOS: $REPOS,
-                          EVERY_HOURS: ($EVERY_HOURS | tonumber? // $EVERY_HOURS),
+                          EVERY_MINUTES: ($EVERY_MINUTES | tonumber? // $EVERY_MINUTES),
                           INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL}},
         agent_loaded: $loaded,
-        schedule_hours: ($hours | split(" ") | map(tonumber? // empty)),
+        schedule_minutes: ($slots | split(" ") | map(tonumber? // empty)),
         pr_state: $state,
         last_run_error: (if $last_error == "" then null else $last_error end),
         last_run_at: ($last_run | tonumber? // null),
@@ -1256,7 +1338,7 @@ cmd_status() {
   echo
   if [ "$(uname -s)" = "Darwin" ]; then
     if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-      echo "Agent: loaded ($LABEL), runs every $EVERY_HOURS h (at $(schedule_hours) h)"
+      echo "Agent: loaded ($LABEL), runs $(schedule_desc)"
     else
       echo "Agent: not loaded"
     fi
@@ -1298,7 +1380,12 @@ fmt_epoch() { date -r "$1" '+%F %H:%M' 2>/dev/null || date -d "@$1" '+%F %H:%M';
 # Seconds from a macOS sysctl shaped like "{ sec = N, usec = ... }"; 0 if it doesn't exist.
 sysctl_sec() { sysctl -n "$1" 2>/dev/null | sed -nE 's/^\{ sec = ([0-9]+).*/\1/p' | grep . || echo 0; }
 
-plist_hours() { plutil -extract StartCalendarInterval json -o - "$PLIST" 2>/dev/null | jq -r 'map(.Hour) | join(" ")'; }
+# Minutes of the day the LaunchAgent runs at; an entry without Hour repeats every hour.
+plist_slots() {
+  plutil -extract StartCalendarInterval json -o - "$PLIST" 2>/dev/null | jq -r '
+    [.[] | if has("Hour") then .Hour * 60 + (.Minute // 0) else range(0; 24) as $h | $h * 60 + (.Minute // 0) end]
+    | sort | map(tostring) | join(" ")'
+}
 
 # Result of a doctor check: ok, warn or fail, with the fix if there is one.
 DOCTOR_CHECKS=""
@@ -1317,33 +1404,39 @@ probe() {
   return $rc
 }
 
-# Whether launchd fired the last scheduled hour. Only counts if the machine was on at that
-# hour: asleep, launchd runs on wake; powered off, that run is lost and it's not a failure.
+# Whether launchd fired the last scheduled run. Only counts if the machine was on at that
+# time: asleep, launchd runs on wake; powered off, that run is lost and it's not a failure.
 check_last_run() {
-  local hours now now_h h slot=0 slot_at last boot wake installed expected
-  hours=$(plist_hours)
-  [ -n "$hours" ] || return 0
+  local slots now now_m m slot=0 next="" slot_at last boot wake installed expected grace
+  slots=$(plist_slots)
+  [ -n "$slots" ] || return 0
   now=$(date +%s)
-  now_h=$((10#$(date +%H)))
-  for h in $hours; do [ "$h" -le "$now_h" ] && slot=$h; done
-  slot_at=$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date +%F) $(printf %02d "$slot"):00:00" +%s)
+  now_m=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+  for m in $slots; do
+    if [ "$m" -le "$now_m" ]; then slot=$m; elif [ -z "$next" ]; then next=$m; fi
+  done
+  [ -n "$next" ] || next=$(awk '{print $1}' <<<"$slots")
+  slot_at=$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date +%F) $(printf '%02d:%02d' $((slot / 60)) $((slot % 60))):00" +%s)
   last=$(cat "$LAST_RUN" 2>/dev/null)
   [[ "$last" =~ ^[0-9]+$ ]] || last=0
   boot=$(sysctl_sec kern.boottime)
   wake=$(sysctl_sec kern.waketime)
   installed=$(stat -f %m "$PLIST" 2>/dev/null || echo 0)
+  # Half the interval, capped at 15 min: with frequent runs the next slot comes before 15 min go by.
+  grace=900
+  [[ "$EVERY_MINUTES" =~ ^[0-9]+$ ]] && [ "$EVERY_MINUTES" -lt 60 ] && grace=$((EVERY_MINUTES * 30))
   if [ "$last" -ge "$slot_at" ]; then
     check ok last_run "last run: $(fmt_epoch "$last")"
   elif [ "$installed" -gt "$slot_at" ] || [ "$boot" -gt "$slot_at" ]; then
-    check ok last_run "not due to run yet (next: $hours h)"
+    check ok last_run "not due to run yet (next: $(fmt_slot "$next"))"
   else
     expected=$slot_at
     [ "$wake" -gt "$expected" ] && expected=$wake
-    if [ $((now - expected)) -gt 900 ]; then
+    if [ $((now - expected)) -gt "$grace" ]; then
       check fail last_run "should have run at $(fmt_epoch "$expected") and didn't (last: $([ "$last" -gt 0 ] && fmt_epoch "$last" || echo never))" \
         "check launchctl print gui/$(id -u)/$LABEL and $STATE_DIR/launchd.err.log; then gh pr-watcher install --yes"
     else
-      check ok last_run "due to run now (at $(printf %02d "$slot"):00)"
+      check ok last_run "due to run now (at $(fmt_slot "$slot"))"
     fi
   fi
 }
@@ -1389,6 +1482,8 @@ cmd_doctor() {
     if probe validate_config; then
       config_ok=1
       check ok config "valid config ($CONFIG)"
+      [ "$LEGACY_EVERY" = "1" ] && check warn config_legacy "the config still uses EVERY_HOURS, replaced by EVERY_MINUTES" \
+        "gh pr-watcher install (rewrites the config and the schedule)"
     else
       check fail config "$PROBE_MSG" "fix it in $CONFIG or with gh pr-watcher install"
     fi
@@ -1425,15 +1520,15 @@ cmd_doctor() {
     elif ! agent_loaded; then
       check fail agent "the LaunchAgent exists but isn't loaded" "gh pr-watcher install --yes"
     else
-      local plist_gh plist_h
+      local plist_gh plist_s
       plist_gh=$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null)
-      plist_h=$(plist_hours)
+      plist_s=$(plist_slots)
       if [ ! -x "$plist_gh" ]; then
         check fail agent "the LaunchAgent points to a gh that no longer exists ($plist_gh)" "gh pr-watcher install --yes"
-      elif [ "$config_ok" = "1" ] && [ "$plist_h" != "$(schedule_hours)" ]; then
-        check fail agent "scheduled at $plist_h h, but EVERY_HOURS=$EVERY_HOURS means $(schedule_hours) h" "gh pr-watcher install --yes"
+      elif [ "$config_ok" = "1" ] && [ "$plist_s" != "$(schedule_slots)" ]; then
+        check fail agent "the LaunchAgent doesn't match EVERY_MINUTES=$EVERY_MINUTES ($(every_label "$EVERY_MINUTES"))" "gh pr-watcher install --yes"
       else
-        check ok agent "scheduled at $plist_h h ($LABEL)"
+        check ok agent "scheduled $(schedule_desc) ($LABEL)"
       fi
       check_last_run
     fi

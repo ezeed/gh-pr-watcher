@@ -44,7 +44,7 @@ It reads your accounts, orgs and repos with `detect` and installs with flags, no
 
 ```bash
 gh pr-watcher detect
-gh pr-watcher install --owners "AcmeCorp" --every-hours 6
+gh pr-watcher install --owners "AcmeCorp" --every 1h
 ```
 
 ### Requirements
@@ -61,7 +61,7 @@ gh pr-watcher install --owners "AcmeCorp" --every-hours 6
 ## Configuration
 
 It lives in `~/.config/gh-pr-watcher/config`: `KEY=VALUE` lines that are read, never executed.
-Changes apply from the next run; only `EVERY_HOURS` needs `gh pr-watcher install --yes` to
+Changes apply from the next run; only `EVERY_MINUTES` needs `gh pr-watcher install --yes` to
 reschedule.
 
 | Key | Default | What it controls |
@@ -69,7 +69,7 @@ reschedule.
 | `GH_USER` | *(empty)* | `gh` account to use, even if another one is active. Empty = the active `gh` account on each run. |
 | `OWNERS` | *(empty)* | Orgs or users whose repos are watched, space-separated. Empty = all your open PRs, in any repo. The installer suggests your orgs. |
 | `REPOS` | *(empty)* | Specific `owner/repo` repos, space-separated. If set, **only those** are watched and `OWNERS` is ignored (GitHub search combines org and repo with AND, not OR). |
-| `EVERY_HOURS` | `6` | How often it runs (1 to 24), counting from 0:00: `6` = 0:00, 6:00, 12:00 and 18:00. If the machine is asleep at that time, launchd runs it on wake. |
+| `EVERY_MINUTES` | `60` | How often it runs, in minutes: `15`, `30`, `60`, `120` or `180`, counting from 0:00 (`180` = 0:00, 3:00, 6:00…). If the machine is asleep at that time, launchd runs it on wake. Each update triggers CI, so a shorter interval can mean more CI runs when several merges land close together. A config with the old `EVERY_HOURS` keeps working until the next `install`. |
 | `INCLUDE_DRAFTS` | `false` | `true` = drafts get updated too. |
 | `SKIP_LABEL` | *(empty)* | PRs with this label are left alone. The installer offers `no-autoupdate`; in the file you can use any label. |
 | `NOTIFY_IMAGE` | *(the logo)* | Local image (PNG or JPG) shown on the right of the notification. Only with `terminal-notifier`. The icon on the left can't be changed: macOS takes it from the notifying app. |
@@ -78,11 +78,11 @@ A misspelled key (`OWNER=`) or a line that isn't `KEY=VALUE` isn't silently igno
 warning, with a suggestion if it looks like a real key. `install` also checks that every owner and
 repo exists and that your account can see it.
 
-The log and state live in `~/.local/state/gh-pr-watcher/`. While a PR stays conflicting, every
-run reminds you: a single notification for all of them, which opens the PR if there is one or a
+The log and state live in `~/.local/state/gh-pr-watcher/`. While a PR stays conflicting, you
+get reminded at most once an hour (right away if a new one shows up or the list changes): a single notification for all of them, which opens the PR if there is one or a
 local page listing them if there are several. The state only remembers since when each conflict
-has been open: deleting it is harmless. Each log keeps its last 2000 lines (about a month with a
-few open PRs); older ones are dropped on each run.
+has been open: deleting it is harmless. Each log keeps its last 2000 lines (from days to a month, depending on the frequency
+and how many PRs are open); older ones are dropped on each run.
 
 ## Commands
 
@@ -112,7 +112,7 @@ existing config and anything missing comes from the defaults.
 | `--user LOGIN` | `gh` account to use (`GH_USER`). |
 | `--owners "A B"` | Orgs or users to watch (`OWNERS`). `""` = all your PRs. |
 | `--repos "o/r o/r"` | Only these repos (`REPOS`); replaces `--owners`. |
-| `--every-hours N` | How often it runs, 1 to 24 (`EVERY_HOURS`). |
+| `--every 15m\|30m\|1h\|2h\|3h` | How often it runs (`EVERY_MINUTES`). `--every-hours 1\|2\|3` still works. |
 | `--drafts` · `--no-drafts` | Update drafts or not (`INCLUDE_DRAFTS`). |
 | `--skip-label L` · `--no-skip-label` | Exclude PRs with label L or not (`SKIP_LABEL`). |
 | `--notify-image PATH` | Notification image (`NOTIFY_IMAGE`). `""` = the logo. |
@@ -132,7 +132,7 @@ changes nothing and sends no notifications. It checks:
 - The config: misspelled keys and invalid values.
 - The `gh` session, the `repo` scope, and that each owner and repo exists and your account sees it.
 - The schedule: that the LaunchAgent is loaded, that it points to a `gh` that still exists (brew
-  sometimes moves it) and that its hours match `EVERY_HOURS`.
+  sometimes moves it) and that its schedule matches `EVERY_MINUTES`.
 - **That it actually ran.** No notification covers this: if launchd stops firing, there's no error.
   `doctor` compares the last run with the last scheduled time; if the machine was off at that time
   it doesn't flag it, and if it was asleep it waits for launchd to run it on wake.

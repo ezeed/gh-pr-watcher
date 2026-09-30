@@ -16,7 +16,7 @@ repos and, for each one:
 | Has the `SKIP_LABEL` label | Nothing. |
 | Mergeable and behind its base | `PUT /repos/{repo}/pulls/{n}/update-branch`: merges the base into the branch, which triggers CI. |
 | Mergeable and up to date | Nothing. |
-| Conflicting | Notification on **every run** while it stays conflicting, grouped with the other conflicting PRs. |
+| Conflicting | Notification while it stays conflicting, grouped with the other conflicting PRs: at most once an hour, and right away when a new one shows up or the list changes. |
 | GitHub still computing mergeability | Retries for a few seconds; otherwise it waits for the next run. |
 
 - **It does not resolve conflicts.** If GitHub's three-way merge applies cleanly, it updates the
@@ -31,12 +31,13 @@ repos and, for each one:
   `git pull` fixes it.
 - **Every update triggers CI.** With "require branches to be up to date", each merge to the base
   can mean one extra CI run per ready PR per person using it. The cap is the number of runs per
-  day (`EVERY_HOURS`).
+  day (`EVERY_MINUTES`): a shorter interval batches fewer merges into one update.
 - `gh` reads its token from the keychain, which works under launchd.
 
 There are only two notifications, and they are not configurable:
 
-- **Conflict:** one notification per run for all conflicting PRs, replacing the previous one.
+- **Conflict:** one notification for all conflicting PRs, replacing the previous one, repeated at most
+  once an hour unless a new one shows up or the list changes.
   With one PR, `<repo>#<n> · conflict needs attention` (or `· still conflicting since HH:MM`), and
   clicking it opens the PR. With several, `N PRs with conflicts (M new)` listing them, and clicking
   it opens `~/.local/state/gh-pr-watcher/conflicts.html`, a page with a link to each one. When no
@@ -77,7 +78,7 @@ It returns JSON like this:
   "orgs": ["AcmeCorp"],
   "repos_with_prs": ["AcmeCorp/api", "AcmeCorp/web", "ana/dotfiles"],
   "config": {"path": "...", "exists": false,
-             "values": {"GH_USER": "", "OWNERS": "", "REPOS": "", "EVERY_HOURS": 6,
+             "values": {"GH_USER": "", "OWNERS": "", "REPOS": "", "EVERY_MINUTES": 60,
                         "INCLUDE_DRAFTS": false, "SKIP_LABEL": ""}},
   "installed": {"plist_exists": false, "agent_loaded": false, ...},
   "last_run_error": null,
@@ -124,8 +125,8 @@ Don't ask about notifications: the conflict notification is always on and not co
 First show what it will write, then install:
 
 ```bash
-gh pr-watcher install --dry-run --owners "AcmeCorp" --every-hours 6 --no-drafts --no-skip-label
-gh pr-watcher install           --owners "AcmeCorp" --every-hours 6 --no-drafts --no-skip-label
+gh pr-watcher install --dry-run --owners "AcmeCorp" --every 1h --no-drafts --no-skip-label
+gh pr-watcher install           --owners "AcmeCorp" --every 1h --no-drafts --no-skip-label
 ```
 
 | Flag | Key | Value |
@@ -133,7 +134,7 @@ gh pr-watcher install           --owners "AcmeCorp" --every-hours 6 --no-drafts 
 | `--user LOGIN` | `GH_USER` | One of `accounts[].login`. Empty = the active account on each run. |
 | `--owners "A B"` | `OWNERS` | Orgs or users, space-separated. `""` = all PRs. |
 | `--repos "o/r o/r"` | `REPOS` | Only those repos. **Replaces** `OWNERS` (GitHub search combines org and repo with AND). |
-| `--every-hours N` | `EVERY_HOURS` | 1 to 24, counting from 0:00. |
+| `--every 15m\|30m\|1h\|2h\|3h` | `EVERY_MINUTES` | Counting from 0:00. Default `1h`. |
 | `--drafts` / `--no-drafts` | `INCLUDE_DRAFTS` | |
 | `--skip-label L` / `--no-skip-label` | `SKIP_LABEL` | The convention is `no-autoupdate`. |
 | `--notify-image PATH` | `NOTIFY_IMAGE` | Image attached to notifications. `""` = the bundled one. |
@@ -189,7 +190,8 @@ common ones:
 | `could not connect to GitHub` | No network or a proxy: retry; it isn't a config problem. |
 | `user or org 'X' does not exist on GitHub` / `repo 'X' does not exist or your account has no access to it` | Fix `--owners`/`--repos` with the values from `detect`. |
 | `… must be separated by spaces, not commas` / `REPOS has an invalid repo` | Owners and repos are space-separated; repos are `owner/repo`. |
-| `EVERY_HOURS must be a number from 1 to 24` | An integer from 1 to 24. |
+| `EVERY_MINUTES must be one of 15 30 60 120 180` / `--every must be …` | `--every 15m`, `30m`, `1h`, `2h` or `3h`. |
+| `EVERY_HOURS=N is no longer offered` | An old config with more than 3 h: pass `--every` with one of the offered values. |
 | `NOTIFY_IMAGE is not a readable file` | An existing local path, or `--notify-image ""`. |
 | `launchctl bootstrap failed` | Check the plist at `detect.installed.plist` with `plutil -lint`. |
 
