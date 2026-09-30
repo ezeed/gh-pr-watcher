@@ -11,6 +11,8 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$NAME"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$NAME"
 CONFIG="$CONFIG_DIR/config"
 STATE="$STATE_DIR/state.json"
+CONFLICTS="$STATE_DIR/conflicts.json"
+CONFLICTS_PAGE="$STATE_DIR/conflicts.html"
 LOG="$STATE_DIR/watcher.log"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LAST_ERROR="$STATE_DIR/last_error"
@@ -294,11 +296,73 @@ APPLESCRIPT
   return 0
 }
 
-# Keeps the PR's previous state when a run gets no new answer;
-# without this, an already notified conflict gets notified again. Uses cmd_run's variables.
+# Keeps the PR's previous state when a run gets no new answer, so a known conflict stays in
+# the reminder instead of dropping out of it. Uses cmd_run's variables.
 keep_prev() {
-  [ -n "$prev" ] && new_state=$(jq --arg k "$key" --arg v "$prev" '.[$k]=$v' <<<"$new_state")
-  return 0
+  [ -n "$prev" ] || return 0
+  new_state=$(jq --arg k "$key" --arg v "$prev" '.[$k]=$v' <<<"$new_state")
+  [ "$prev" = "CONFLICTING" ] || return 0
+  conflicts=$(jq --arg k "$key" --arg u "https://github.com/$repo/pull/$num" --argjson now "$now" \
+    --argjson old "$old_conflicts" \
+    '. + [$old[$k] // {title: "", url: $u, behind: "?", base: "", since: $now} | .key = $k]' <<<"$conflicts")
+}
+
+# "core#926" out of "N5Now/core#926": the owner is noise in a notification.
+short_key() { printf '%s' "${1#*/}"; }
+
+# Local page listing the open conflicts, for the notification that groups several.
+write_conflicts_page() { # conflicts_json
+  jq -r --arg now "$(date '+%F %H:%M')" '
+    def row: "<li><a href=\"\(.url | @html)\">\(.key | @html)</a>"
+      + (if .title != "" then " · \(.title | @html)" else "" end)
+      + "<small>\(.behind | tostring | @html) commits behind \(.base | @html)"
+      + " · conflicting since \(.since | strflocaltime("%F %H:%M"))</small></li>";
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>PR watcher · conflicts</title>",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>",
+    ":root{color-scheme:light dark;--fg:#1f2328;--muted:#59636e;--bg:#fff;--link:#0969da;--line:#d1d9e0}",
+    "@media (prefers-color-scheme:dark){:root{--fg:#f0f6fc;--muted:#9198a1;--bg:#0d1117;--link:#4493f8;--line:#3d444d}}",
+    "body{font:15px/1.5 -apple-system,system-ui,sans-serif;color:var(--fg);background:var(--bg);max-width:720px;margin:40px auto;padding:0 16px}",
+    "h1{font-size:20px}ul{list-style:none;padding:0}li{padding:12px 0;border-bottom:1px solid var(--line)}",
+    "a{color:var(--link);font-weight:600}small{display:block;color:var(--muted)}p{color:var(--muted)}",
+    "</style></head><body>",
+    (if length == 0 then "<h1>No PRs with conflicts</h1>"
+     else "<h1>\(length) PRs with conflicts</h1><ul>" + (map(row) | join("")) + "</ul>" end),
+    "<p>Updated \($now) by gh pr-watcher.</p></body></html>"' <<<"$1"
+}
+
+# One notification for every open conflict, repeated each run while they last;
+# the shared group makes each one replace the previous banner.
+notify_conflicts() { # conflicts_json dry_run
+  local n new first subtitle message url
+  n=$(jq length <<<"$1")
+  if [ "$n" = "0" ]; then
+    [ "$2" = "0" ] && command -v terminal-notifier >/dev/null \
+      && terminal-notifier -remove "$NAME-conflicts" >/dev/null 2>&1
+    return 0
+  fi
+  new=$(jq --argjson now "$now" '[.[] | select(.since == $now)] | length' <<<"$1")
+  if [ "$n" = "1" ]; then
+    first=$(jq -c '.[0]' <<<"$1")
+    url=$(jq -r .url <<<"$first")
+    if [ "$new" = "1" ]; then
+      subtitle="$(short_key "$(jq -r .key <<<"$first")") · conflict needs attention"
+    else
+      subtitle="$(short_key "$(jq -r .key <<<"$first")") · still conflicting since $(jq -r '.since | strflocaltime("%H:%M")' <<<"$first")"
+    fi
+    message=$(jq -r '(if .title != "" then "\(.title) " else "" end) + "(\(.behind) commits behind \(.base))."' <<<"$first")
+  else
+    url="file://$CONFLICTS_PAGE"
+    subtitle="$n PRs with conflicts"
+    [ "$new" != "0" ] && subtitle="$subtitle ($new new)"
+    message=$(jq -r '[.[].key | sub("^[^/]*/"; "")] | join(", ")' <<<"$1")
+  fi
+  if [ "$2" = "1" ]; then
+    log "(dry-run) would notify: $subtitle — $message"
+    return 0
+  fi
+  [ "$n" = "1" ] || write_conflicts_page "$1" >"$CONFLICTS_PAGE"
+  log "notifying: $subtitle — $message"
+  notify "$subtitle" "$message" "$url" "conflicts"
 }
 
 cmd_run() {
@@ -327,13 +391,18 @@ cmd_run() {
   fi
   [ "$IN_RUN" = "1" ] && trim_logs
 
-  local old_state='{}'
+  local old_state='{}' old_conflicts='{}' now
+  now=$(date +%s)
   if [ -s "$STATE" ]; then
     if jq -e 'type == "object"' "$STATE" >/dev/null 2>&1; then
       old_state=$(cat "$STATE")
     else
-      warn "the state ($STATE) was corrupted and is discarded; open conflicts will be notified again"
+      warn "the state ($STATE) was corrupted and is discarded"
     fi
+  fi
+  if [ -s "$CONFLICTS" ]; then
+    old_conflicts=$(jq -c 'if type == "array" then map({(.key): .}) | add // {} else {} end' "$CONFLICTS" 2>/dev/null) \
+      || old_conflicts='{}'
   fi
 
   local args=(search prs --author @me --state open --limit 100
@@ -370,7 +439,7 @@ cmd_run() {
     return 0
   fi
 
-  local new_state='{}' repo num key prev info mergeable attempt
+  local new_state='{}' conflicts='[]' repo num key prev info mergeable attempt
   local oid head head_owner base url title behind out
   while read -r repo num; do
     key="$repo#$num"
@@ -402,15 +471,15 @@ cmd_run() {
 
     case "$mergeable" in
       CONFLICTING)
-        if [ "$prev" != "CONFLICTING" ] && [ "$dry_run" = "1" ]; then
-          log "$key: CONFLICT ($behind behind) → (dry-run) would notify"
-        elif [ "$prev" != "CONFLICTING" ]; then
-          log "$key: CONFLICT ($behind behind) → notifying"
-          notify "$key · conflict needs attention" "$title ($behind commits behind $base)." "$url" "$key"
+        if [ "$prev" != "CONFLICTING" ]; then
+          log "$key: CONFLICT ($behind behind)"
         else
-          log "$key: still conflicting ($behind behind), already notified"
+          log "$key: still conflicting ($behind behind)"
         fi
-        new_state=$(jq --arg k "$key" '.[$k]="CONFLICTING"' <<<"$new_state") ;;
+        new_state=$(jq --arg k "$key" '.[$k]="CONFLICTING"' <<<"$new_state")
+        conflicts=$(jq --arg k "$key" --arg t "$title" --arg u "$url" --arg b "$behind" --arg base "$base" \
+          --argjson now "$now" --argjson old "$old_conflicts" \
+          '. + [{key: $k, title: $t, url: $u, behind: $b, base: $base, since: ($old[$k].since // $now)}]' <<<"$conflicts") ;;
       MERGEABLE)
         if [ "$prev" = "CONFLICTING" ]; then
           log "$key: conflict resolved"
@@ -431,8 +500,10 @@ cmd_run() {
     esac
   done <<<"$prs"
 
+  notify_conflicts "$conflicts" "$dry_run"
   if [ "$dry_run" = "0" ]; then
     printf '%s\n' "$new_state" >"$STATE.tmp.$$" && mv -f "$STATE.tmp.$$" "$STATE"
+    printf '%s\n' "$conflicts" >"$CONFLICTS.tmp.$$" && mv -f "$CONFLICTS.tmp.$$" "$CONFLICTS"
   fi
   run_ok
 }
@@ -1381,7 +1452,7 @@ cmd_doctor() {
       "fix the issues above and try gh pr-watcher run; the error clears once a run succeeds"
   fi
   if [ -s "$STATE" ] && ! jq -e 'type == "object"' "$STATE" >/dev/null 2>&1; then
-    check warn state "the state is corrupted: the next run discards it and notifies the open conflicts again"
+    check warn state "the state is corrupted: the next run discards it and counts the open conflicts as new"
   fi
   if [ -d "$LOCK_DIR" ]; then
     local pid

@@ -78,8 +78,10 @@ Una clave mal escrita (`OWNER=`) o una línea que no es `KEY=VALUE` no se ignora
 avisa, con una sugerencia si se parece a una clave real. `install` además verifica que cada owner
 y cada repo existan y que tu cuenta los vea.
 
-El log y el estado quedan en `~/.local/state/gh-pr-watcher/`. El estado solo sirve para no repetir
-avisos: borrarlo es inocuo. Cada log guarda sus últimas 2000 líneas (más o menos un mes con
+El log y el estado quedan en `~/.local/state/gh-pr-watcher/`. Mientras un PR siga en conflicto,
+cada vuelta te lo recuerda: una sola notificación para todos, que abre el PR si hay uno o una
+página local con la lista si hay varios. El estado solo recuerda desde cuándo está abierto cada
+conflicto: borrarlo es inocuo. Cada log guarda sus últimas 2000 líneas (más o menos un mes con
 algunos PRs abiertos); las anteriores se descartan en cada vuelta.
 
 ## Comandos

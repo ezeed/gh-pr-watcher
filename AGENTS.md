@@ -16,7 +16,7 @@ repos and, for each one:
 | Has the `SKIP_LABEL` label | Nothing. |
 | Mergeable and behind its base | `PUT /repos/{repo}/pulls/{n}/update-branch`: merges the base into the branch, which triggers CI. |
 | Mergeable and up to date | Nothing. |
-| Conflicting | Notification (clicking it opens the PR), **once**, when the PR becomes conflicting. |
+| Conflicting | Notification on **every run** while it stays conflicting, grouped with the other conflicting PRs. |
 | GitHub still computing mergeability | Retries for a few seconds; otherwise it waits for the next run. |
 
 - **It does not resolve conflicts.** If GitHub's three-way merge applies cleanly, it updates the
@@ -36,7 +36,11 @@ repos and, for each one:
 
 There are only two notifications, and they are not configurable:
 
-- **Conflict:** `<repo>#<n> · conflict needs attention`. Clicking it opens the PR.
+- **Conflict:** one notification per run for all conflicting PRs, replacing the previous one.
+  With one PR, `<repo>#<n> · conflict needs attention` (or `· still conflicting since HH:MM`), and
+  clicking it opens the PR. With several, `N PRs with conflicts (M new)` listing them, and clicking
+  it opens `~/.local/state/gh-pr-watcher/conflicts.html`, a page with a link to each one. When no
+  conflict is left, the notification is removed.
 - **Stopped working:** `stopped working · gh pr-watcher doctor`, with the error as the body (expired
   `gh` session, invalid config, an owner that doesn't exist). Clicking it opens the log. It isn't
   repeated while the error stays the same. Without network it notifies nothing: it logs it and

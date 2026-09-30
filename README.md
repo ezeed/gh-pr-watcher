@@ -78,8 +78,10 @@ A misspelled key (`OWNER=`) or a line that isn't `KEY=VALUE` isn't silently igno
 warning, with a suggestion if it looks like a real key. `install` also checks that every owner and
 repo exists and that your account can see it.
 
-The log and state live in `~/.local/state/gh-pr-watcher/`. The state only prevents repeated
-notifications: deleting it is harmless. Each log keeps its last 2000 lines (about a month with a
+The log and state live in `~/.local/state/gh-pr-watcher/`. While a PR stays conflicting, every
+run reminds you: a single notification for all of them, which opens the PR if there is one or a
+local page listing them if there are several. The state only remembers since when each conflict
+has been open: deleting it is harmless. Each log keeps its last 2000 lines (about a month with a
 few open PRs); older ones are dropped on each run.
 
 ## Commands
