@@ -32,6 +32,8 @@ gh pr-watcher install          # asks for the config and schedules the run
 gh pr-watcher run --dry-run    # test: reports what it would do, without updating any branch
 ```
 
+To pin a version: `gh extension install ezeed/gh-pr-watcher --pin v0.2.0` (see [releases](https://github.com/ezeed/gh-pr-watcher/releases)).
+
 ### With an agent
 
 Ask your coding agent (Claude Code, Codex, Cursor…):

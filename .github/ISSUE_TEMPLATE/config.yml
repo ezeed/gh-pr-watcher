@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ideas and questions
+    url: https://github.com/ezeed/gh-pr-watcher/discussions
+    about: Feature ideas, questions and how you use it go to Discussions.

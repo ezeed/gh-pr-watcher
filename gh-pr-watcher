@@ -3,7 +3,7 @@
 # and sends a notification when a conflict needs to be resolved by hand.
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 NAME="gh-pr-watcher"
 LABEL="local.gh-pr-watcher"
 
@@ -295,10 +295,7 @@ validate_config() {
   for rp in $REPOS; do
     [[ "$rp" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "REPOS has an invalid repo: '$rp' (expected owner/repo)"
   done
-  local b
-  for b in INCLUDE_DRAFTS; do
-    case "${!b}" in true|false) ;; *) die "$b must be true or false (got '${!b}')" ;; esac
-  done
+  case "$INCLUDE_DRAFTS" in true|false) ;; *) die "INCLUDE_DRAFTS must be true or false (got '$INCLUDE_DRAFTS')" ;; esac
 }
 
 # With GH_USER, the whole run uses that account's token even if another one is active.
@@ -451,7 +448,7 @@ cmd_run() {
   fi
 
   local args=(search prs --author @me --state open --limit 100
-    --json repository,number,isDraft,labels,title,url)
+    --json "repository,number,isDraft,labels,title,url")
   local o r
   # gh search ANDs --owner and --repo: when repos are chosen, orgs are not passed.
   if [ -n "$REPOS" ]; then

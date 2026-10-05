@@ -1,0 +1,30 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, what happened instead, and how to reproduce it.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `gh pr-watcher doctor`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Relevant lines of `gh pr-watcher log`
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `gh pr-watcher version` and `gh --version`, plus your OS.
+    validations:
+      required: true
