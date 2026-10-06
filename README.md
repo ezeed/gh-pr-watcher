@@ -9,6 +9,14 @@
   A <a href="https://cli.github.com">GitHub CLI</a> extension that runs on its own a few times a day.
 </p>
 
+<p align="center">
+  <a href="https://github.com/ezeed/gh-pr-watcher/actions/workflows/lint.yml"><img src="https://github.com/ezeed/gh-pr-watcher/actions/workflows/lint.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/ezeed/gh-pr-watcher/releases"><img src="https://img.shields.io/github/v/release/ezeed/gh-pr-watcher" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://cli.github.com"><img src="https://img.shields.io/badge/gh-extension-blue" alt="gh extension"></a>
+  <a href="https://github.com/ezeed/gh-pr-watcher/stargazers"><img src="https://img.shields.io/github/stars/ezeed/gh-pr-watcher?style=social" alt="Stars"></a>
+</p>
+
 <p align="center"><b>English</b> · <a href="README.es.md">Español</a></p>
 
 ---
@@ -23,6 +31,15 @@ the base leaves all open PRs behind, and each one has to be updated before it ca
 <p align="center">
   <img src="assets/notification.gif" alt="Conflict notification" width="600">
 </p>
+
+What a run looks like (the same lines go to `gh pr-watcher log`):
+
+```text
+$ gh pr-watcher run
+2026-10-06 10:00:04 acme/api#412: 3 behind → branch updated from main (CI will run)
+2026-10-06 10:00:06 acme/api#418: up to date
+2026-10-06 10:00:09 acme/web#97: CONFLICT (5 behind)
+```
 
 ## Install
 
