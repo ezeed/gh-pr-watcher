@@ -109,28 +109,60 @@ warn() {
   if [ "$IN_RUN" = "1" ]; then log "warning: $*"; else echo "warning: $*" >&2; fi
 }
 
-# No network is not a watcher failure: during a run it waits for the next one, silently.
-offline() {
-  if [ "$IN_RUN" = "1" ]; then
-    log "no connection to GitHub, will retry next run ($*)"
-    exit 0
-  fi
-  die "could not connect to GitHub: $*"
+# Known transient failures, as "case-insensitive ERE::reason". They fix themselves, so a run
+# that hits one waits for the next instead of reporting the watcher as broken.
+TRANSIENT_ERRORS=(
+  'dial tcp::no connection to GitHub'
+  'no such host::no connection to GitHub'
+  'connection refused::no connection to GitHub'
+  'connection reset::no connection to GitHub'
+  'network is unreachable::no connection to GitHub'
+  'no route to host::no connection to GitHub'
+  'host is down::no connection to GitHub'
+  'tls handshake::no connection to GitHub'
+  'i/o timeout::no connection to GitHub'
+  'timed out::no connection to GitHub'
+  'context deadline exceeded::no connection to GitHub'
+  'broken pipe::no connection to GitHub'
+  'unexpected EOF::no connection to GitHub'
+  'http2: (client connection lost|server sent GOAWAY)|stream error::no connection to GitHub'
+  'HTTP 5(00|02|03|04)::GitHub is failing'
+  'something went wrong while executing your query::GitHub is failing'
+  'HTTP 429|rate limit::GitHub rate limit hit'
+)
+
+# Prints the reason of a known transient failure; fails when the error is not one.
+transient_reason() {
+  local entry
+  for entry in "${TRANSIENT_ERRORS[@]}"; do
+    if grep -qiE "${entry%%::*}" <<<"$1"; then
+      printf '%s\n' "${entry#*::}"
+      return 0
+    fi
+  done
+  return 1
 }
 
-is_network_error() {
-  grep -qiE 'dial tcp|no such host|connection refused|i/o timeout|tls handshake|network is unreachable|context deadline|connection reset' <<<"$1"
+# Returns when the error is not transient; otherwise a run waits for the next one, silently.
+retry_if_transient() {
+  local reason
+  reason=$(transient_reason "$1") || return 0
+  if [ "$IN_RUN" = "1" ]; then
+    log "$reason, will retry next run ($1)"
+    exit 0
+  fi
+  die "$reason, try again later: $1"
 }
 
 # gh with stderr captured; gh_err returns the reason for the last failure on one line.
 ghq() { gh "$@" 2>"$GH_ERR_FILE"; }
 gh_err() { grep -v '^{' "$GH_ERR_FILE" 2>/dev/null | head -3 | tr '\n' ' ' | sed 's/ *$//'; }
 
-# Stops with gh's reason, telling a missing network apart from a real error.
+# Stops with gh's reason, telling a transient failure apart from a real error.
 gh_fail() {
   local what="$1" err
   err=$(gh_err)
-  is_network_error "$err" && offline "$err"
+  retry_if_transient "$err"
   die "$what: ${err:-no details from gh}"
 }
 
@@ -179,7 +211,7 @@ require_session() {
   state=$(jq -r '.state // ""' <<<"$entry")
   if [ "$state" != "success" ]; then
     err=$(jq -r '.error // ""' <<<"$entry")
-    is_network_error "$err" && offline "$err"
+    retry_if_transient "$err"
     die "the gh session for '$login' is not valid (${err:-$state}); run gh auth refresh -h github.com"
   fi
   scopes=$(jq -r '.scopes // ""' <<<"$entry")
@@ -606,14 +638,14 @@ check_targets() {
   for o in $OWNERS; do
     ghq api "users/$o" --jq .login >/dev/null && continue
     err=$(gh_err)
-    is_network_error "$err" && offline "$err"
+    retry_if_transient "$err"
     case "$err" in *"HTTP 404"*) die "user or org '$o' does not exist on GitHub" ;; esac
     die "could not verify '$o': $err"
   done
   for r in $REPOS; do
     ghq api "repos/$r" --jq .full_name >/dev/null && continue
     err=$(gh_err)
-    is_network_error "$err" && offline "$err"
+    retry_if_transient "$err"
     case "$err" in *"HTTP 404"*) die "repo '$r' does not exist or your account has no access to it" ;; esac
     die "could not verify '$r': $err"
   done

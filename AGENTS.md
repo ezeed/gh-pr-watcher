@@ -44,8 +44,9 @@ There are only two notifications, and they are not configurable:
   conflict is left, the notification is removed.
 - **Stopped working:** `stopped working · gh pr-watcher doctor`, with the error as the body (expired
   `gh` session, invalid config, an owner that doesn't exist). Clicking it opens the log. It isn't
-  repeated while the error stays the same. Without network it notifies nothing: it logs it and
-  tries again next run.
+  repeated while the error stays the same. A known transient failure (no network, a timeout,
+  a GitHub 5xx or rate limit; the list is `TRANSIENT_ERRORS` in the script) notifies nothing: it
+  logs it and tries again next run.
 
 ## 1. Check dependencies
 
@@ -187,7 +188,7 @@ common ones:
 | `jq is missing` / `gh, the GitHub CLI, is missing` / `your gh is too old` | `brew install jq`, `brew install gh` or `brew upgrade gh`, with permission. |
 | `gh has no session on github.com` / `gh has no session as 'X'` | The person runs `gh auth login`. |
 | `the gh session for 'X' is not valid` / `the token for 'X' is missing the repo scope` | The person runs the `gh auth refresh …` the message shows. |
-| `could not connect to GitHub` | No network or a proxy: retry; it isn't a config problem. |
+| `no connection to GitHub, try again later` / `GitHub is failing, try again later` / `GitHub rate limit hit, try again later` | Transient: retry in a few minutes; it isn't a config problem. If it persists without network, check the proxy. |
 | `user or org 'X' does not exist on GitHub` / `repo 'X' does not exist or your account has no access to it` | Fix `--owners`/`--repos` with the values from `detect`. |
 | `… must be separated by spaces, not commas` / `REPOS has an invalid repo` | Owners and repos are space-separated; repos are `owner/repo`. |
 | `EVERY_MINUTES must be one of 15 30 60 120 180` / `--every must be …` | `--every 15m`, `30m`, `1h`, `2h` or `3h`. |
