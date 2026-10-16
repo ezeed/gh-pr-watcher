@@ -3,7 +3,7 @@
 # and sends a notification when a conflict needs to be resolved by hand.
 set -uo pipefail
 
-VERSION="0.3.0"
+VERSION="0.2.1"
 NAME="gh-pr-watcher"
 LABEL="local.gh-pr-watcher"
 
