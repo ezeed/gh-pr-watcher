@@ -14,6 +14,11 @@ STATE="$STATE_DIR/state.json"
 CONFLICTS="$STATE_DIR/conflicts.json"
 CONFLICTS_PAGE="$STATE_DIR/conflicts.html"
 REMINDED="$STATE_DIR/conflicts_reminded.json"
+CHANGES="$STATE_DIR/changes_requested.json"
+CHANGES_PAGE="$STATE_DIR/changes_requested.html"
+UPDATES="$STATE_DIR/updates.json"
+LAST_ACTIONS="$STATE_DIR/last_actions.json"
+CI_PAGE="$STATE_DIR/ci_failed.html"
 LOG="$STATE_DIR/watcher.log"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LAST_ERROR="$STATE_DIR/last_error"
@@ -23,12 +28,14 @@ LOG_MAX_LINES=2000
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_IMAGE="$SELF_DIR/assets/icon.png"
 
-CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_MINUTES INCLUDE_DRAFTS SKIP_LABEL NOTIFY_IMAGE"
+CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_MINUTES INCLUDE_DRAFTS SKIP_LABEL NOTIFY_IMAGE NOTIFY_CHANGES_REQUESTED NOTIFY_CI_FAILED"
 # Read from older configs and converted to EVERY_MINUTES; never written.
 LEGACY_KEYS="EVERY_HOURS"
 EVERY_OPTIONS="15 30 60 120 180"
 # Conflicts already notified are reminded at most this often, whatever the frequency.
 REMIND_EVERY_SEC=3300
+# An update whose CI hasn't finished (or never starts) is no longer followed after this long.
+FOLLOW_UPDATE_SEC=86400
 
 # Defaults; the config file overrides them.
 GH_USER=""
@@ -40,6 +47,8 @@ LEGACY_EVERY=0
 INCLUDE_DRAFTS="false"
 SKIP_LABEL=""
 NOTIFY_IMAGE=""
+NOTIFY_CHANGES_REQUESTED="true"
+NOTIFY_CI_FAILED="false"
 
 # IN_RUN=1 inside a real run: fatal errors go to the log and get notified,
 # because under launchd nobody reads stderr.
@@ -66,12 +75,18 @@ Commands:
     --skip-label L | --no-skip-label
                             Exclude PRs with label L.
     --notify-image PATH     Image attached to notifications ("" = the bundled one).
+    --notify-changes-requested | --no-notify-changes-requested
+                            Notify when a review requests changes (on by default).
+    --notify-ci-failed | --no-notify-ci-failed
+                            Notify when CI fails on a branch the watcher updated (off by default).
     --yes                   Don't ask: existing config + flags + defaults.
     --dry-run               Show what it would write, without touching anything.
   detect [--user LOGIN]   JSON with what's needed to decide the install: accounts,
                           orgs, repos with your PRs, dependencies, current config and install.
   run [--dry-run]         One run now. --dry-run reports without updating branches,
                           notifying or saving state.
+  list [--json]           Your open PRs as a run sees them, the ones that need you first:
+                          state, CI, reviews and what the last run did. Changes nothing.
   test-notify             Sends a test notification.
   doctor [--json]         Checks dependencies, session, config, schedule and the last
                           run, with the fix for each problem. Changes nothing.
@@ -308,6 +323,12 @@ SKIP_LABEL=$SKIP_LABEL
 
 # Local PNG/JPG image attached to notifications (terminal-notifier only). Empty = the bundled one.
 NOTIFY_IMAGE=$NOTIFY_IMAGE
+
+# true = notify once when a review requests changes on one of your PRs.
+NOTIFY_CHANGES_REQUESTED=$NOTIFY_CHANGES_REQUESTED
+
+# true = notify once when CI fails on a branch the watcher updated (not on your own pushes).
+NOTIFY_CI_FAILED=$NOTIFY_CI_FAILED
 EOF
 }
 
@@ -328,6 +349,10 @@ validate_config() {
     [[ "$rp" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "REPOS has an invalid repo: '$rp' (expected owner/repo)"
   done
   case "$INCLUDE_DRAFTS" in true|false) ;; *) die "INCLUDE_DRAFTS must be true or false (got '$INCLUDE_DRAFTS')" ;; esac
+  case "$NOTIFY_CHANGES_REQUESTED" in true|false) ;;
+    *) die "NOTIFY_CHANGES_REQUESTED must be true or false (got '$NOTIFY_CHANGES_REQUESTED')" ;;
+  esac
+  case "$NOTIFY_CI_FAILED" in true|false) ;; *) die "NOTIFY_CI_FAILED must be true or false (got '$NOTIFY_CI_FAILED')" ;; esac
 }
 
 # With GH_USER, the whole run uses that account's token even if another one is active.
@@ -373,14 +398,14 @@ keep_prev() {
 # "core#926" out of "N5Now/core#926": the owner is noise in a notification.
 short_key() { printf '%s' "${1#*/}"; }
 
-# Local page listing the open conflicts, for the notification that groups several.
-write_conflicts_page() { # conflicts_json
-  jq -r --arg now "$(date '+%F %H:%M')" '
+# Local page listing PRs, for the notifications that group several. Each item has key, url,
+# title and detail.
+write_prs_page() { # what items_json
+  jq -r --arg what "$1" --arg now "$(date '+%F %H:%M')" '
     def row: "<li><a href=\"\(.url | @html)\">\(.key | @html)</a>"
       + (if .title != "" then " · \(.title | @html)" else "" end)
-      + "<small>\(.behind | tostring | @html) commits behind \(.base | @html)"
-      + " · conflicting since \(.since | strflocaltime("%F %H:%M"))</small></li>";
-    "<!doctype html><html><head><meta charset=\"utf-8\"><title>PR watcher · conflicts</title>",
+      + "<small>\(.detail | @html)</small></li>";
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>PR watcher · \($what | @html)</title>",
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>",
     ":root{color-scheme:light dark;--fg:#1f2328;--muted:#59636e;--bg:#fff;--link:#0969da;--line:#d1d9e0}",
     "@media (prefers-color-scheme:dark){:root{--fg:#f0f6fc;--muted:#9198a1;--bg:#0d1117;--link:#4493f8;--line:#3d444d}}",
@@ -388,9 +413,136 @@ write_conflicts_page() { # conflicts_json
     "h1{font-size:20px}ul{list-style:none;padding:0}li{padding:12px 0;border-bottom:1px solid var(--line)}",
     "a{color:var(--link);font-weight:600}small{display:block;color:var(--muted)}p{color:var(--muted)}",
     "</style></head><body>",
-    (if length == 0 then "<h1>No PRs with conflicts</h1>"
-     else "<h1>\(length) PRs with conflicts</h1><ul>" + (map(row) | join("")) + "</ul>" end),
-    "<p>Updated \($now) by gh pr-watcher.</p></body></html>"' <<<"$1"
+    (if length == 0 then "<h1>No PRs with \($what | @html)</h1>"
+     else "<h1>\(length) PRs with \($what | @html)</h1><ul>" + (map(row) | join("")) + "</ul>" end),
+    "<p>Updated \($now) by gh pr-watcher.</p></body></html>"' <<<"$2"
+}
+
+write_conflicts_page() { # conflicts_json
+  write_prs_page conflicts "$(jq 'map(.detail = "\(.behind) commits behind \(.base)"
+    + " · conflicting since \(.since | strflocaltime("%F %H:%M"))")' <<<"$1")"
+}
+
+# One notification for the PRs that moved to changes requested in this run; a PR already notified
+# isn't notified again until it leaves that state and comes back. Uses cmd_run's old_changes and now.
+notify_changes_requested() { # changes_json dry_run
+  local fresh n total subtitle message url first
+  fresh=$(jq -c --argjson old "$old_changes" '[.[] | select($old[.key] == null)]' <<<"$1")
+  n=$(jq length <<<"$fresh")
+  total=$(jq length <<<"$1")
+  if [ "$total" = "0" ] && [ "$2" = "0" ] && command -v terminal-notifier >/dev/null; then
+    terminal-notifier -remove "$NAME-changes" >/dev/null 2>&1
+  fi
+  [ "$n" = "0" ] && return 0
+  if [ "$NOTIFY_CHANGES_REQUESTED" != "true" ]; then
+    log "$n PR(s) with changes requested, not notified (NOTIFY_CHANGES_REQUESTED=false)"
+    return 0
+  fi
+  if [ "$n" = "1" ]; then
+    first=$(jq -c '.[0]' <<<"$fresh")
+    url=$(jq -r .url <<<"$first")
+    subtitle="$(short_key "$(jq -r .key <<<"$first")") · changes requested"
+    message=$(jq -r '[(if .title != "" then .title else empty end), (if .by != "" then "by \(.by)" else empty end)]
+      | join(" · ")' <<<"$first")
+  else
+    url="file://$CHANGES_PAGE"
+    subtitle="$n PRs with changes requested"
+    message=$(jq -r '[.[].key | sub("^[^/]*/"; "")] | join(", ")' <<<"$fresh")
+  fi
+  if [ "$2" = "1" ]; then
+    log "(dry-run) would notify: $subtitle — $message"
+    return 0
+  fi
+  [ "$n" = "1" ] || write_prs_page "changes requested" "$(jq 'map(.detail = "changes requested"
+    + (if .by != "" then " by \(.by)" else "" end) + " · since \(.since | strflocaltime("%F %H:%M"))")' <<<"$1")" \
+    >"$CHANGES_PAGE"
+  log "notifying: $subtitle — $message"
+  notify "$subtitle" "$message" "$url" "changes"
+}
+
+# Follows a branch update the watcher made. The first run that sees a new head checks that it is
+# the watcher's merge commit (two parents, the first one the head it updated); from then on, while
+# the head stays there, it reads its checks: a failure goes to ci_failed (fresh the first time), a
+# pass ends the follow-up. A push of your own in between or on top ends it too. Uses cmd_run's variables.
+follow_update() {
+  local entry from sha parents failed pending
+  entry=$(jq -c --arg k "$key" '.[$k] // empty' <<<"$old_updates")
+  [ -n "$entry" ] || return 0
+  from=$(jq -r '.from // ""' <<<"$entry")
+  sha=$(jq -r '.sha // ""' <<<"$entry")
+  if [ -z "$sha" ]; then
+    if [ "$oid" = "$from" ]; then
+      # GitHub hasn't merged it yet.
+      [ $((now - $(jq -r '.at // 0' <<<"$entry"))) -lt "$FOLLOW_UPDATE_SEC" ] && keep_update "$entry"
+      return 0
+    fi
+    if ! parents=$(gh api "repos/$repo/commits/$oid" --jq '[.parents[].sha] | join(" ")' 2>/dev/null); then
+      keep_update "$entry"
+      return 0
+    fi
+    if [ "$(wc -w <<<"$parents" | tr -d ' ')" != "2" ] || [ "${parents%% *}" != "$from" ]; then
+      did "$key" "the head moved by a push of yours, not following its CI"
+      return 0
+    fi
+    sha="$oid"
+    entry=$(jq -c --arg s "$sha" '.sha = $s' <<<"$entry")
+  fi
+  [ "$oid" = "$sha" ] || return 0
+  failed=$(jq -r '[.statusCheckRollup[]?
+    | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"))
+    | .name // .context] | unique | join(", ")' <<<"$info")
+  if [ -n "$failed" ]; then
+    if jq -e '.failed' <<<"$entry" >/dev/null; then
+      did "$key" "CI still failing on the watcher's update ($failed)"
+    else
+      did "$key" "CI failed on the watcher's update ($failed)"
+    fi
+    ci_failed=$(jq --arg k "$key" --arg t "$title" --arg u "$url" --arg f "$failed" --arg b "$base" \
+      --argjson fresh "$(jq '.failed | not' <<<"$entry")" \
+      '. + [{key: $k, title: $t, url: $u, failed: $f, base: $b, fresh: $fresh}]' <<<"$ci_failed")
+    keep_update "$(jq -c --arg f "$failed" '.failed = $f' <<<"$entry")"
+    return 0
+  fi
+  pending=$(jq '[.statusCheckRollup[]? | select(
+      (.__typename == "CheckRun" and .status != "COMPLETED")
+      or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED")))] | length' <<<"$info")
+  if [ "$pending" = "0" ] && [ "$(jq '.statusCheckRollup | length' <<<"$info")" != "0" ]; then
+    did "$key" "CI passed on the watcher's update"
+  elif [ $((now - $(jq -r '.at // 0' <<<"$entry"))) -lt "$FOLLOW_UPDATE_SEC" ]; then
+    keep_update "$entry"
+  fi
+}
+
+keep_update() { updates=$(jq --arg k "$key" --argjson e "$1" '.[$k] = $e' <<<"$updates"); }
+
+# One notification for the watcher's updates whose CI failed for the first time in this run.
+notify_ci_failed() { # ci_failed_json dry_run
+  local fresh n subtitle message url first
+  if [ "$(jq length <<<"$1")" = "0" ]; then
+    [ "$2" = "0" ] && command -v terminal-notifier >/dev/null && terminal-notifier -remove "$NAME-ci" >/dev/null 2>&1
+    return 0
+  fi
+  fresh=$(jq -c '[.[] | select(.fresh)]' <<<"$1")
+  n=$(jq length <<<"$fresh")
+  [ "$n" = "0" ] && return 0
+  if [ "$n" = "1" ]; then
+    first=$(jq -c '.[0]' <<<"$fresh")
+    url="$(jq -r .url <<<"$first")/checks"
+    subtitle="$(short_key "$(jq -r .key <<<"$first")") · CI failed after the update"
+    message=$(jq -r '(if .title != "" then "\(.title) · " else "" end) + "failed: \(.failed)"' <<<"$first")
+  else
+    url="file://$CI_PAGE"
+    subtitle="$n PRs with CI failing after the update"
+    message=$(jq -r '[.[].key | sub("^[^/]*/"; "")] | join(", ")' <<<"$fresh")
+  fi
+  if [ "$2" = "1" ]; then
+    log "(dry-run) would notify: $subtitle — $message"
+    return 0
+  fi
+  [ "$n" = "1" ] || write_prs_page "CI failing after an update" \
+    "$(jq 'map(.detail = "failed: \(.failed) · after merging \(.base) into it")' <<<"$1")" >"$CI_PAGE"
+  log "notifying: $subtitle — $message"
+  notify "$subtitle" "$message" "$url" "ci"
 }
 
 # One notification for every open conflict, repeated while they last but at most every
@@ -439,6 +591,55 @@ notify_conflicts() { # conflicts_json dry_run
   jq -n --argjson at "$now" --arg keys "$keys" '{at: $at, keys: $keys}' >"$REMINDED"
 }
 
+# The search a run makes, in SEARCH_ARGS (a function can't return an array, and gh_fail must
+# run in the caller's shell to stop it).
+search_args() {
+  SEARCH_ARGS=(search prs --author @me --state open --limit 100
+    --json "repository,number,isDraft,labels,title,url")
+  local o r
+  # gh search ANDs --owner and --repo: when repos are chosen, orgs are not passed.
+  if [ -n "$REPOS" ]; then
+    for r in $REPOS; do SEARCH_ARGS+=(--repo "$r"); done
+  else
+    for o in $OWNERS; do SEARCH_ARGS+=(--owner "$o"); done
+  fi
+}
+
+# "owner/repo number" for each PR of the search a run looks at: no drafts or skip label, per config.
+watched_prs() { # search_json
+  jq -r --arg skip "$SKIP_LABEL" --argjson drafts "$INCLUDE_DRAFTS" '
+    .[] | select($drafts or (.isDraft | not))
+        | select($skip == "" or ([.labels[].name] | index($skip) | not))
+        | "\(.repository.nameWithOwner) \(.number)"' <<<"$1"
+}
+
+PR_FIELDS="mergeable,headRefOid,headRefName,headRepositoryOwner,baseRefName,url,title,createdAt,reviewDecision,latestReviews,statusCheckRollup"
+
+# The PR as JSON; empty if it can't be read. GitHub computes mergeable lazily: the first query
+# usually returns UNKNOWN, so it asks again a few times.
+view_pr() { # repo num
+  local info attempt
+  for attempt in 1 2 3 4; do
+    info=$(gh pr view "$2" -R "$1" --json "$PR_FIELDS" 2>/dev/null) || info=""
+    [ -n "$info" ] || break
+    [ "$(jq -r .mergeable <<<"$info")" != "UNKNOWN" ] && break
+    sleep $((attempt * 5))
+  done
+  printf '%s' "$info"
+}
+
+# Logs what the run did to the PR and keeps it for list. Uses cmd_run's actions.
+did() { # key message
+  log "$1: $2"
+  actions=$(jq --arg k "$1" --arg d "$2" '.[$k] = $d' <<<"$actions")
+}
+
+save_actions() {
+  [ "$1" = "0" ] || return 0
+  jq -n --argjson now "$now" --argjson prs "$actions" '{at: $now, prs: $prs}' >"$LAST_ACTIONS.tmp.$$" \
+    && mv -f "$LAST_ACTIONS.tmp.$$" "$LAST_ACTIONS"
+}
+
 cmd_run() {
   local dry_run=0
   while [ $# -gt 0 ]; do
@@ -478,63 +679,55 @@ cmd_run() {
     old_conflicts=$(jq -c 'if type == "array" then map({(.key): .}) | add // {} else {} end' "$CONFLICTS" 2>/dev/null) \
       || old_conflicts='{}'
   fi
-
-  local args=(search prs --author @me --state open --limit 100
-    --json "repository,number,isDraft,labels,title,url")
-  local o r
-  # gh search ANDs --owner and --repo: when repos are chosen, orgs are not passed.
-  if [ -n "$REPOS" ]; then
-    for r in $REPOS; do args+=(--repo "$r"); done
-  else
-    for o in $OWNERS; do args+=(--owner "$o"); done
+  local old_updates='{}'
+  if [ "$NOTIFY_CI_FAILED" = "true" ] && [ -s "$UPDATES" ]; then
+    old_updates=$(jq -c 'if type == "object" then . else {} end' "$UPDATES" 2>/dev/null) || old_updates='{}'
+  fi
+  local old_changes='{}'
+  if [ -s "$CHANGES" ]; then
+    old_changes=$(jq -c 'if type == "array" then map({(.key): .}) | add // {} else {} end' "$CHANGES" 2>/dev/null) \
+      || old_changes='{}'
   fi
 
   local found
-  found=$(ghq "${args[@]}") || gh_fail "the PR search on GitHub failed"
+  search_args
+  found=$(ghq "${SEARCH_ARGS[@]}") || gh_fail "the PR search on GitHub failed"
 
   local prs
-  prs=$(jq -r --arg skip "$SKIP_LABEL" --argjson drafts "$INCLUDE_DRAFTS" '
-    .[] | select($drafts or (.isDraft | not))
-        | select($skip == "" or ([.labels[].name] | index($skip) | not))
-        | "\(.repository.nameWithOwner) \(.number)"' <<<"$found")
+  prs=$(watched_prs "$found")
 
-  local skipped
+  local skipped actions='{}' skipped_key skipped_why
   skipped=$(jq -r --arg skip "$SKIP_LABEL" --argjson drafts "$INCLUDE_DRAFTS" '
-    .[] | if (.isDraft and ($drafts | not)) then "\(.repository.nameWithOwner)#\(.number): draft, left alone"
-          elif ($skip != "" and ([.labels[].name] | index($skip))) then "\(.repository.nameWithOwner)#\(.number): label \($skip), left alone"
+    .[] | if (.isDraft and ($drafts | not)) then "\(.repository.nameWithOwner)#\(.number)\tdraft, left alone"
+          elif ($skip != "" and ([.labels[].name] | index($skip))) then "\(.repository.nameWithOwner)#\(.number)\tlabel \($skip), left alone"
           else empty end' <<<"$found")
-  [ -n "$skipped" ] && while read -r line; do log "$line"; done <<<"$skipped"
+  [ -n "$skipped" ] && while IFS=$'\t' read -r skipped_key skipped_why; do did "$skipped_key" "$skipped_why"; done <<<"$skipped"
 
   if [ -z "$prs" ]; then
     # The state is not wiped: with the wrong account the search comes back empty, and switching
     # back to the right one would repeat the notifications. Every run with PRs rebuilds it anyway.
     [ -z "$skipped" ] && log "no open PRs"
+    save_actions "$dry_run"
     run_ok
     return 0
   fi
 
-  local new_state='{}' conflicts='[]' repo num key prev info mergeable attempt
-  local oid head head_owner base url title behind out
+  local new_state='{}' conflicts='[]' changes='[]' updates='{}' ci_failed='[]' repo num key prev info mergeable
+  local oid head head_owner base url title behind out review by
   while read -r repo num; do
     key="$repo#$num"
     prev=$(jq -r --arg k "$key" '.[$k] // ""' <<<"$old_state")
 
-    # GitHub computes mergeable lazily: the first query usually returns UNKNOWN.
-    info=""
-    for attempt in 1 2 3 4; do
-      info=$(gh pr view "$num" -R "$repo" \
-        --json mergeable,headRefOid,headRefName,headRepositoryOwner,baseRefName,url,title 2>/dev/null) || info=""
-      [ -n "$info" ] || break
-      mergeable=$(jq -r .mergeable <<<"$info")
-      [ "$mergeable" != "UNKNOWN" ] && break
-      sleep $((attempt * 5))
-    done
+    info=$(view_pr "$repo" "$num")
     if [ -z "$info" ]; then
-      log "$key: could not read the PR, will retry next run"
+      did "$key" "could not read the PR, will retry next run"
       keep_prev
+      changes=$(jq --arg k "$key" --argjson old "$old_changes" 'if $old[$k] then . + [$old[$k]] else . end' <<<"$changes")
+      updates=$(jq --arg k "$key" --argjson old "$old_updates" 'if $old[$k] then .[$k] = $old[$k] else . end' <<<"$updates")
       continue
     fi
 
+    mergeable=$(jq -r .mergeable <<<"$info")
     oid=$(jq -r .headRefOid <<<"$info")
     head=$(jq -r .headRefName <<<"$info")
     head_owner=$(jq -r .headRepositoryOwner.login <<<"$info")
@@ -543,12 +736,23 @@ cmd_run() {
     title=$(jq -r .title <<<"$info")
     behind=$(gh api "repos/$repo/compare/$base...$head_owner:$head" --jq .behind_by 2>/dev/null || echo "?")
 
+    review=$(jq -r '.reviewDecision // ""' <<<"$info")
+    if [ "$review" = "CHANGES_REQUESTED" ]; then
+      by=$(jq -r '[.latestReviews[]? | select(.state == "CHANGES_REQUESTED") | .author.login // empty] | unique | join(", ")' <<<"$info")
+      jq -e --arg k "$key" 'has($k)' <<<"$old_changes" >/dev/null || did "$key" "changes requested${by:+ by $by}"
+      changes=$(jq --arg k "$key" --arg t "$title" --arg u "$url" --arg by "$by" --argjson now "$now" \
+        --argjson old "$old_changes" '. + [{key: $k, title: $t, url: $u, by: $by, since: ($old[$k].since // $now)}]' <<<"$changes")
+    elif jq -e --arg k "$key" 'has($k)' <<<"$old_changes" >/dev/null; then
+      did "$key" "changes no longer requested"
+    fi
+    [ "$NOTIFY_CI_FAILED" = "true" ] && follow_update
+
     case "$mergeable" in
       CONFLICTING)
         if [ "$prev" != "CONFLICTING" ]; then
-          log "$key: CONFLICT ($behind behind)"
+          did "$key" "CONFLICT ($behind behind)"
         else
-          log "$key: still conflicting ($behind behind)"
+          did "$key" "still conflicting ($behind behind)"
         fi
         new_state=$(jq --arg k "$key" '.[$k]="CONFLICTING"' <<<"$new_state")
         conflicts=$(jq --arg k "$key" --arg t "$title" --arg u "$url" --arg b "$behind" --arg base "$base" \
@@ -556,30 +760,122 @@ cmd_run() {
           '. + [{key: $k, title: $t, url: $u, behind: $b, base: $base, since: ($old[$k].since // $now)}]' <<<"$conflicts") ;;
       MERGEABLE)
         if [ "$prev" = "CONFLICTING" ]; then
-          log "$key: conflict resolved"
+          did "$key" "conflict resolved"
         fi
         if [ "$behind" = "0" ]; then
-          log "$key: up to date"
+          did "$key" "up to date"
         elif [ "$dry_run" = "1" ]; then
-          log "$key: $behind behind → (dry-run) would update the branch"
+          did "$key" "$behind behind → (dry-run) would update the branch"
         elif out=$(gh api -X PUT "repos/$repo/pulls/$num/update-branch" -f expected_head_sha="$oid" 2>&1); then
-          log "$key: $behind behind → branch updated from $base (CI will run)"
+          did "$key" "$behind behind → branch updated from $base (CI will run)"
+          [ "$NOTIFY_CI_FAILED" = "true" ] && keep_update "$(jq -cn --arg f "$oid" --argjson now "$now" '{from: $f, at: $now}')"
         else
-          log "$key: $behind behind, not updated: $(tr '\n' ' ' <<<"$out")"
+          did "$key" "$behind behind, not updated: $(tr '\n' ' ' <<<"$out")"
         fi
         new_state=$(jq --arg k "$key" '.[$k]="MERGEABLE"' <<<"$new_state") ;;
       *)
-        log "$key: GitHub is still computing mergeable ($mergeable), skipping this run"
+        did "$key" "GitHub is still computing mergeable ($mergeable), skipping this run"
         keep_prev ;;
     esac
   done <<<"$prs"
 
   notify_conflicts "$conflicts" "$dry_run"
+  notify_changes_requested "$changes" "$dry_run"
+  notify_ci_failed "$ci_failed" "$dry_run"
   if [ "$dry_run" = "0" ]; then
     printf '%s\n' "$new_state" >"$STATE.tmp.$$" && mv -f "$STATE.tmp.$$" "$STATE"
     printf '%s\n' "$conflicts" >"$CONFLICTS.tmp.$$" && mv -f "$CONFLICTS.tmp.$$" "$CONFLICTS"
+    printf '%s\n' "$changes" >"$CHANGES.tmp.$$" && mv -f "$CHANGES.tmp.$$" "$CHANGES"
+    printf '%s\n' "$updates" >"$UPDATES.tmp.$$" && mv -f "$UPDATES.tmp.$$" "$UPDATES"
   fi
+  save_actions "$dry_run"
   run_ok
+}
+
+# One row per PR a run looks at, the ones that need you first. Reads only: no updates, no
+# notifications, no state, no lock.
+cmd_list() {
+  local json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      *) die "unknown option for list: $1" ;;
+    esac
+    shift
+  done
+  load_config
+  validate_config
+  require_jq
+  require_gh
+  require_session
+  use_account
+
+  local found prs repo num info behind last='{}' rows='[]'
+  search_args
+  found=$(ghq "${SEARCH_ARGS[@]}") || gh_fail "the PR search on GitHub failed"
+  prs=$(watched_prs "$found")
+  if [ -s "$LAST_ACTIONS" ]; then
+    last=$(jq -c '.prs // {} | if type == "object" then . else {} end' "$LAST_ACTIONS" 2>/dev/null) || last='{}'
+  fi
+
+  if [ -n "$prs" ]; then
+    while read -r repo num; do
+      info=$(view_pr "$repo" "$num")
+      behind=""
+      if [ -n "$info" ]; then
+        behind=$(gh api "repos/$repo/compare/$(jq -r .baseRefName <<<"$info")...$(jq -r .headRepositoryOwner.login <<<"$info"):$(jq -r .headRefName <<<"$info")" \
+          --jq .behind_by 2>/dev/null) || behind=""
+      else
+        info='{}'
+      fi
+      rows=$(jq --arg repo "$repo" --argjson num "$num" --arg behind "$behind" --argjson last "$last" --argjson info "$info" '
+        ($info.statusCheckRollup // []) as $checks
+        | ([$checks[] | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"))
+            | .name // .context] | unique) as $failed
+        | . + [{
+            repo: $repo, number: $num, title: ($info.title // ""), url: ($info.url // "https://github.com/\($repo)/pull/\($num)"),
+            mergeable: ($info.mergeable // null),
+            behind: (if $behind == "" then null else ($behind | tonumber) end),
+            ci: (if ($checks | length) == 0 then null
+                 elif ($failed | length) > 0 then "failing"
+                 elif any($checks[]; (.__typename == "CheckRun" and .status != "COMPLETED")
+                          or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED"))) then "pending"
+                 else "passing" end),
+            failed_checks: $failed,
+            review: (if ($info.reviewDecision // "") == "" then null else $info.reviewDecision end),
+            last_run: ($last["\($repo)#\($num)"] // null),
+            created_at: ($info.createdAt // null)}]' <<<"$rows")
+    done <<<"$prs"
+  fi
+
+  rows=$(jq 'map(.state = (if .mergeable == "CONFLICTING" then "conflict"
+                           elif .mergeable == "MERGEABLE" and .behind != null then (if .behind > 0 then "behind" else "up_to_date" end)
+                           else "unknown" end)
+           | .rank = (if .state == "conflict" then 0 elif .review == "CHANGES_REQUESTED" then 1 elif .ci == "failing" then 2
+                      elif .state == "behind" then 3 elif .state == "up_to_date" then 4 else 5 end))
+         | sort_by(.rank, .repo, .number) | map(del(.rank))' <<<"$rows")
+  if [ "$json" = "1" ]; then
+    printf '%s\n' "$rows"
+    return 0
+  fi
+  if [ "$(jq length <<<"$rows")" = "0" ]; then
+    echo "no open PRs"
+    return 0
+  fi
+  jq -r 'def pad($n): . + (" " * ($n - length) // "");
+    def age: (now - (fromdateiso8601? // now)) | floor
+      | if . < 3600 then "\(. / 60 | floor)m" elif . < 86400 then "\(. / 3600 | floor)h" else "\(. / 86400 | floor)d" end;
+    [["REPO", "PR", "STATE", "CI", "REVIEWS", "LAST RUN", "AGE", "TITLE"]]
+    + map([.repo, "#\(.number)",
+           (if .state == "conflict" then "conflict" elif .state == "behind" then "\(.behind) behind"
+            elif .state == "up_to_date" then "up to date" else "?" end),
+           (.ci // "-"),
+           ({APPROVED: "approved", CHANGES_REQUESTED: "changes requested", REVIEW_REQUIRED: "review required"}[.review // ""] // "-"),
+           (.last_run // "-"),
+           (if .created_at then (.created_at | age) else "-" end),
+           .title])
+    | (transpose | map(map(length) | max)) as $w
+    | .[] | [to_entries[] | .key as $i | if $i < 7 then (.value | pad($w[$i])) else .value end] | join("  ")' <<<"$rows"
 }
 
 # A real run that finished fine clears the last error (without notifying: it only logs it).
@@ -727,6 +1023,7 @@ cmd_detect() {
     --arg config_path "$CONFIG" --argjson config_exists "$config_exists" \
     --arg GH_USER "$cfg_user" --arg OWNERS "$OWNERS" --arg REPOS "$REPOS" \
     --arg EVERY_MINUTES "$EVERY_MINUTES" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
+    --arg NOTIFY_CHANGES_REQUESTED "$NOTIFY_CHANGES_REQUESTED" --arg NOTIFY_CI_FAILED "$NOTIFY_CI_FAILED" \
     --arg label "$LABEL" --arg plist "$PLIST" --argjson loaded "$loaded" --argjson plist_exists "$plist_exists" \
     --argjson others "$(other_agents | lines_json)" \
     --argjson errors "$(printf '%s' "$errors" | jq -s .)" \
@@ -749,7 +1046,9 @@ cmd_detect() {
         exists: $config_exists,
         values: {GH_USER: $GH_USER, OWNERS: $OWNERS, REPOS: $REPOS,
                  EVERY_MINUTES: ($EVERY_MINUTES | tonumber? // $EVERY_MINUTES),
-                 INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL}
+                 INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL,
+                 NOTIFY_CHANGES_REQUESTED: ($NOTIFY_CHANGES_REQUESTED == "true"),
+                 NOTIFY_CI_FAILED: ($NOTIFY_CI_FAILED == "true")}
       },
       installed: {label: $label, plist: $plist, plist_exists: $plist_exists, agent_loaded: $loaded},
       last_run_error: (if $last_error == "" then null else $last_error end),
@@ -1119,8 +1418,8 @@ schedule_path() {
 
 cmd_install() {
   local yes=0 dry_run=0 flags=0
-  local f_user="" f_owners="" f_repos="" f_every="" f_drafts="" f_skip="" f_image=""
-  local set_user=0 set_owners=0 set_repos=0 set_every=0 set_drafts=0 set_skip=0 set_image=0
+  local f_user="" f_owners="" f_repos="" f_every="" f_drafts="" f_skip="" f_image="" f_changes="" f_ci=""
+  local set_user=0 set_owners=0 set_repos=0 set_every=0 set_drafts=0 set_skip=0 set_image=0 set_changes=0 set_ci=0
   while [ $# -gt 0 ]; do
     local opt="$1" val=""
     case "$opt" in
@@ -1144,11 +1443,15 @@ cmd_install() {
       --skip-label) f_skip="$val"; set_skip=1 ;;
       --no-skip-label) f_skip=""; set_skip=1 ;;
       --notify-image) f_image="$val"; set_image=1 ;;
+      --notify-changes-requested) f_changes=true; set_changes=1 ;;
+      --no-notify-changes-requested) f_changes=false; set_changes=1 ;;
+      --notify-ci-failed) f_ci=true; set_ci=1 ;;
+      --no-notify-ci-failed) f_ci=false; set_ci=1 ;;
       *) die "unknown option for install: $opt" ;;
     esac
     shift
   done
-  flags=$((set_user + set_owners + set_repos + set_every + set_drafts + set_skip + set_image))
+  flags=$((set_user + set_owners + set_repos + set_every + set_drafts + set_skip + set_image + set_changes + set_ci))
 
   require_jq
   require_gh
@@ -1162,6 +1465,8 @@ cmd_install() {
   [ "$set_drafts" = "1" ] && INCLUDE_DRAFTS="$f_drafts"
   [ "$set_skip" = "1" ] && SKIP_LABEL="$f_skip"
   [ "$set_image" = "1" ] && NOTIFY_IMAGE="$f_image"
+  [ "$set_changes" = "1" ] && NOTIFY_CHANGES_REQUESTED="$f_changes"
+  [ "$set_ci" = "1" ] && NOTIFY_CI_FAILED="$f_ci"
 
   # With no terminal (an agent, a script) or with flags, nothing is asked.
   local interactive=1
@@ -1245,6 +1550,8 @@ cmd_install() {
     [ -n "$SKIP_LABEL" ] && use_skip_label=true
     ask_bool use_skip_label "Exclude PRs labeled ${SKIP_LABEL:-no-autoupdate}?"
     if [ "$use_skip_label" = "true" ]; then SKIP_LABEL="${SKIP_LABEL:-no-autoupdate}"; else SKIP_LABEL=""; fi
+    ask_bool NOTIFY_CHANGES_REQUESTED "Notify when a review requests changes?"
+    ask_bool NOTIFY_CI_FAILED "Notify when CI fails on a branch it updated?"
     local go=true
     ask_bool go "Install with this config?"
     if [ "$go" != "true" ]; then
@@ -1326,13 +1633,17 @@ cmd_status() {
   load_config
   if [ "${1:-}" = "--json" ]; then
     require_jq
-    local loaded=false config_exists=false state='{}'
+    local loaded=false config_exists=false state='{}' changes='[]' updates='{}'
     agent_loaded && loaded=true
     [ -f "$CONFIG" ] && config_exists=true
     [ -s "$STATE" ] && jq -e . "$STATE" >/dev/null 2>&1 && state=$(cat "$STATE")
+    [ -s "$CHANGES" ] && jq -e 'type == "array"' "$CHANGES" >/dev/null 2>&1 && changes=$(cat "$CHANGES")
+    [ -s "$UPDATES" ] && jq -e 'type == "object"' "$UPDATES" >/dev/null 2>&1 && updates=$(cat "$UPDATES")
     jq -n --arg version "$VERSION" --arg config_path "$CONFIG" --argjson config_exists "$config_exists" \
       --arg GH_USER "$GH_USER" --arg OWNERS "$OWNERS" --arg REPOS "$REPOS" \
       --arg EVERY_MINUTES "$EVERY_MINUTES" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
+      --arg NOTIFY_CHANGES_REQUESTED "$NOTIFY_CHANGES_REQUESTED" --argjson changes "$changes" \
+      --arg NOTIFY_CI_FAILED "$NOTIFY_CI_FAILED" --argjson updates "$updates" \
       --argjson loaded "$loaded" --arg slots "$(schedule_slots)" --argjson state "$state" \
       --argjson log "$(tail -20 "$LOG" 2>/dev/null | lines_json)" \
       --arg last_error "$(cat "$LAST_ERROR" 2>/dev/null)" --arg last_run "$(cat "$LAST_RUN" 2>/dev/null)" \
@@ -1340,10 +1651,14 @@ cmd_status() {
         config: {path: $config_path, exists: $config_exists,
                  values: {GH_USER: $GH_USER, OWNERS: $OWNERS, REPOS: $REPOS,
                           EVERY_MINUTES: ($EVERY_MINUTES | tonumber? // $EVERY_MINUTES),
-                          INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL}},
+                          INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL,
+                          NOTIFY_CHANGES_REQUESTED: ($NOTIFY_CHANGES_REQUESTED == "true"),
+                          NOTIFY_CI_FAILED: ($NOTIFY_CI_FAILED == "true")}},
         agent_loaded: $loaded,
         schedule_minutes: ($slots | split(" ") | map(tonumber? // empty)),
         pr_state: $state,
+        changes_requested: $changes,
+        ci_failed: ($updates | to_entries | map(select(.value.failed) | {key, sha: .value.sha, failed: .value.failed})),
         last_run_error: (if $last_error == "" then null else $last_error end),
         last_run_at: ($last_run | tonumber? // null),
         last_log: $log}'
@@ -1511,6 +1826,10 @@ cmd_doctor() {
     if probe validate_config; then
       config_ok=1
       check ok config "valid config ($CONFIG)"
+      local notifies="conflicts"
+      [ "$NOTIFY_CHANGES_REQUESTED" = "true" ] && notifies="$notifies, reviews that request changes"
+      [ "$NOTIFY_CI_FAILED" = "true" ] && notifies="$notifies, CI failing after an update"
+      check ok notifications "notifies: $notifies"
       [ "$LEGACY_EVERY" = "1" ] && check warn config_legacy "the config still uses EVERY_HOURS, replaced by EVERY_MINUTES" \
         "gh pr-watcher install (rewrites the config and the schedule)"
     else
@@ -1605,7 +1924,7 @@ cmd_doctor() {
 # A one-letter typo (rub, stauts) or a prefix (inst) suggests the real command.
 suggest_command() {
   local typed="$1" c i diff
-  for c in run install uninstall status detect doctor config log test-notify version help; do
+  for c in run list install uninstall status detect doctor config log test-notify version help; do
     if [[ "$c" == "$typed"* ]] && [ ${#typed} -ge 2 ]; then printf ' (did you mean %s?)' "$c"; return 0; fi
     [ ${#c} -eq ${#typed} ] || continue
     diff=0
@@ -1625,6 +1944,7 @@ main() {
   [ $# -gt 0 ] && shift
   case "$cmd" in
     run) cmd_run "$@" ;;
+    list|ls) cmd_list "$@" ;;
     install) cmd_install "$@" ;;
     uninstall) cmd_uninstall ;;
     status) cmd_status "$@" ;;

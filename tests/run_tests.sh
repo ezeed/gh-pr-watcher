@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# jq filters are single-quoted on purpose: their $vars are jq's, passed with --arg.
+# shellcheck disable=SC2016
 # Runs gh-pr-watcher against the fakes in tests/bin (gh, terminal-notifier, osascript, launchctl,
 # sleep), placed first in PATH: no network, no auth, nothing touched outside a temp sandbox.
 #
@@ -55,13 +57,58 @@ pr_view() {
   fixture "$key" "$(jq -n --arg r "$repo" --argjson n "$num" --arg m "$2" '{
     mergeable: $m, headRefOid: "head-\($n)", headRefName: "feat-\($n)",
     headRepositoryOwner: {login: "ana"}, baseRefName: "main",
-    url: "https://github.com/\($r)/pull/\($n)", title: "PR \($n)"}')"
+    url: "https://github.com/\($r)/pull/\($n)", title: "PR \($n)", createdAt: (now - 7200 | todate),
+    reviewDecision: "", latestReviews: [], statusCheckRollup: []}')"
 }
 
-# behind o/r#N COMMITS: how far the head is behind main.
+# patch_view o/r#N CALL|"" JQ [jq args...]: edits what gh pr view returns, on every call or only
+# on that call number (starting from the every-call answer). Goes after pr or pr_view.
+patch_view() {
+  local repo="${1%#*}" num="${1#*#}" call="$2" filter="$3" base f
+  shift 3
+  base="$FIXTURES/$(fixture_key "pr_view_${repo}_$num")"
+  f="$base.json"
+  if [ -n "$call" ]; then
+    f="$base.$call.json"
+    [ -f "$f" ] || cp "$base.json" "$f"
+  fi
+  jq "$@" "$filter" "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+}
+
+# review o/r#N DECISION [REVIEWER] [call]: the PR's reviewDecision, with REVIEWER's latest review
+# in that state.
+review() {
+  patch_view "$1" "${4:-}" '.reviewDecision = $d
+    | .latestReviews = (if $by == "" then [] else [{author: {login: $by}, state: $d}] end)' \
+    --arg d "$2" --arg by "${3:-}"
+}
+
+# head_at o/r#N SHA CALL: the head the PR has on that call.
+head_at() { patch_view "$1" "$3" '.headRefOid = $s' --arg s "$2"; }
+
+# checks o/r#N CALL "name:CONCLUSION"...: the head's checks on that call; IN_PROGRESS = still running.
+checks() {
+  local pr="$1" call="$2" rollup
+  shift 2
+  rollup=$(printf '%s\n' "$@" | jq -R 'split(":") | {__typename: "CheckRun", name: .[0], workflowName: "ci",
+    status: (if .[1] == "IN_PROGRESS" then "IN_PROGRESS" else "COMPLETED" end),
+    conclusion: (if .[1] == "IN_PROGRESS" then "" else .[1] end)}' | jq -s .)
+  patch_view "$pr" "$call" '.statusCheckRollup = $r' --argjson r "$rollup"
+}
+
+# commit o/r SHA PARENT...: the commit, as gh api repos/o/r/commits/SHA returns it.
+commit() {
+  local repo="$1" sha="$2"
+  shift 2
+  fixture "api_GET_repos/$repo/commits/$sha" "$(printf '%s\n' "$@" | jq -R '{sha: .}' | jq -s --arg s "$sha" '{sha: $s, parents: .}')"
+}
+
+# behind o/r#N COMMITS [call]: how far the head is behind main, on every call or only on that one.
 behind() {
-  local repo="${1%#*}" num="${1#*#}"
-  fixture "api_GET_repos/$repo/compare/main...ana:feat-$num" "{\"behind_by\": $2, \"ahead_by\": 1}"
+  local repo="${1%#*}" num="${1#*#}" key
+  key="api_GET_repos/$repo/compare/main...ana:feat-$num"
+  [ -n "${3:-}" ] && key="$key.$3"
+  fixture "$key" "{\"behind_by\": $2, \"ahead_by\": 1}"
 }
 
 # pr o/r#N MERGEABLE|CONFLICTING|UNKNOWN COMMITS_BEHIND: a PR GitHub accepts updating.
@@ -278,22 +325,308 @@ test_search_uses_owners_or_repos() {
   assert_lacks "$GH_CALLS" '^search prs .*--owner acme$'
 }
 
+# ── run: reviews that request changes ──────────────────────────────────────────────────────────
+
+test_changes_requested_notifies_once() {
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  review 'acme/api#7' CHANGES_REQUESTED bob
+  watcher run
+  assert_rc 0
+  assert_has "$NOTIFY_CALLS" '-subtitle api#7 · changes requested -message PR 7 · by bob -open https://github.com/acme/api/pull/7 .*-group gh-pr-watcher-changes' 1
+  assert_log 'acme/api#7: changes requested by bob'
+  assert_json "$STATE_DIR/changes_requested.json" 'length == 1 and .[0].key == "acme/api#7" and .[0].by == "bob"'
+
+  age 3600
+  watcher run
+  assert_notified 1
+  watcher status --json
+  assert_json "$SANDBOX/out" '.changes_requested[0].key == "acme/api#7" and .config.values.NOTIFY_CHANGES_REQUESTED == true'
+}
+
+test_changes_requested_on_several_prs_share_a_page() {
+  search_prs 'acme/api#7' 'acme/web#9'
+  pr 'acme/api#7' MERGEABLE 0
+  pr 'acme/web#9' CONFLICTING 2
+  review 'acme/api#7' CHANGES_REQUESTED bob
+  review 'acme/web#9' CHANGES_REQUESTED carol
+  watcher run
+  assert_rc 0
+  assert_has "$NOTIFY_CALLS" "-subtitle 2 PRs with changes requested -message api#7, web#9 -open file://$STATE_DIR/changes_requested.html" 1
+  assert_has "$STATE_DIR/changes_requested.html" 'changes requested by carol'
+  # The conflict keeps its own notification.
+  assert_has "$NOTIFY_CALLS" '-subtitle web#9 · conflict needs attention' 1
+}
+
+test_changes_requested_again_after_approval_notifies_again() {
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  review 'acme/api#7' CHANGES_REQUESTED bob 1
+  review 'acme/api#7' APPROVED bob 2
+  review 'acme/api#7' CHANGES_REQUESTED carol 3
+  watcher run
+  watcher run
+  assert_log 'acme/api#7: changes no longer requested'
+  assert_json "$STATE_DIR/changes_requested.json" 'length == 0'
+  watcher run
+  assert_notified 2
+  assert_has "$NOTIFY_CALLS" '-message PR 7 · by carol ' 1
+}
+
+test_changes_requested_kept_when_the_pr_cant_be_read() {
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  review 'acme/api#7' CHANGES_REQUESTED bob 1
+  fixture_err pr_view_acme/api_7 'HTTP 502: Bad Gateway'
+  rm "$FIXTURES/$(fixture_key pr_view_acme/api_7).json"
+  watcher run
+  watcher run
+  assert_log 'acme/api#7: could not read the PR'
+  assert_json "$STATE_DIR/changes_requested.json" 'length == 1'
+  assert_notified 1
+}
+
+test_changes_requested_not_notified_when_off() {
+  config NOTIFY_CHANGES_REQUESTED=false
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  review 'acme/api#7' CHANGES_REQUESTED bob
+  watcher run
+  assert_rc 0
+  assert_notified 0
+  assert_log '1 PR\(s\) with changes requested, not notified \(NOTIFY_CHANGES_REQUESTED=false\)'
+  assert_json "$STATE_DIR/changes_requested.json" 'length == 1'
+}
+
+test_notify_changes_requested_config_and_flags() {
+  watcher install --dry-run --no-notify-changes-requested
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^NOTIFY_CHANGES_REQUESTED=false$' 1
+  watcher install --dry-run --notify-changes-requested
+  assert_has "$SANDBOX/out" '^NOTIFY_CHANGES_REQUESTED=true$' 1
+
+  config NOTIFY_CHANGES_REQUESTED=maybe
+  watcher run
+  assert_rc 1
+  assert_log 'NOTIFY_CHANGES_REQUESTED must be true or false'
+
+  config NOTIFY_CHANGES_REQUESTED=false
+  watcher doctor --json
+  assert_json "$SANDBOX/out" '.checks[] | select(.id == "notifications") | .message == "notifies: conflicts"'
+}
+
+# ── run: CI failing after an update ────────────────────────────────────────────────────────────
+
+# A PR behind on the first run, updated by the watcher into merge-N (parents head-N and main).
+updated_pr() {
+  local repo="${1%#*}" num="${1#*#}"
+  pr "$1" MERGEABLE 0
+  behind "$1" 3 1
+  head_at "$1" "merge-$num" 2
+  commit "$repo" "merge-$num" "head-$num" main-sha
+  patch_view "$1" "" '.headRefOid = $s' --arg s "merge-$num"
+  patch_view "$1" 1 '.headRefOid = "head-\(.title | ltrimstr("PR "))"'
+}
+
+test_ci_failure_on_the_watchers_update_notifies_once() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  checks 'acme/api#7' 2 'lint:SUCCESS' 'test:FAILURE'
+  checks 'acme/api#7' '' 'lint:SUCCESS' 'test:FAILURE'
+  watcher run
+  assert_json "$STATE_DIR/updates.json" '.["acme/api#7"].from == "head-7"'
+  assert_notified 0
+  watcher run
+  assert_rc 0
+  assert_log 'acme/api#7: CI failed on the watcher.s update \(test\)'
+  assert_has "$NOTIFY_CALLS" '-subtitle api#7 · CI failed after the update -message PR 7 · failed: test -open https://github.com/acme/api/pull/7/checks .*-group gh-pr-watcher-ci' 1
+  assert_json "$STATE_DIR/updates.json" '.["acme/api#7"].sha == "merge-7"'
+
+  watcher run
+  assert_notified 1
+  assert_log 'CI still failing on the watcher.s update'
+  watcher status --json
+  assert_json "$SANDBOX/out" '.ci_failed == [{key: "acme/api#7", sha: "merge-7", failed: "test"}]'
+}
+
+test_ci_passing_on_the_watchers_update_is_quiet() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  checks 'acme/api#7' 2 'lint:SUCCESS' 'test:IN_PROGRESS'
+  checks 'acme/api#7' 3 'lint:SUCCESS' 'test:SUCCESS'
+  watcher run
+  watcher run
+  assert_json "$STATE_DIR/updates.json" '.["acme/api#7"].sha == "merge-7"'
+  watcher run
+  assert_rc 0
+  assert_log 'acme/api#7: CI passed on the watcher.s update'
+  assert_json "$STATE_DIR/updates.json" '. == {}'
+  assert_notified 0
+}
+
+test_ci_failure_after_your_own_push_is_not_notified() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  # You pushed before GitHub merged: the new head is your commit, on top of the old one.
+  head_at 'acme/api#7' mine-7 2
+  patch_view 'acme/api#7' "" '.headRefOid = "mine-7"'
+  commit acme/api mine-7 head-7
+  checks 'acme/api#7' '' 'test:FAILURE'
+  watcher run
+  watcher run
+  assert_log 'acme/api#7: the head moved by a push of yours'
+  watcher run
+  assert_notified 0
+  assert_json "$STATE_DIR/updates.json" '. == {}'
+}
+
+test_ci_failure_after_a_push_on_top_is_not_notified() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  checks 'acme/api#7' 2 'test:IN_PROGRESS'
+  head_at 'acme/api#7' mine-7 3
+  checks 'acme/api#7' 3 'test:FAILURE'
+  watcher run
+  watcher run
+  watcher run
+  assert_notified 0
+  assert_json "$STATE_DIR/updates.json" '. == {}'
+}
+
+test_ci_failures_on_several_updates_share_a_page() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7' 'acme/web#9'
+  updated_pr 'acme/api#7'
+  updated_pr 'acme/web#9'
+  checks 'acme/api#7' 2 'test:FAILURE'
+  checks 'acme/web#9' 2 'build:TIMED_OUT'
+  watcher run
+  watcher run
+  assert_has "$NOTIFY_CALLS" "-subtitle 2 PRs with CI failing after the update -message api#7, web#9 -open file://$STATE_DIR/ci_failed.html" 1
+  assert_has "$STATE_DIR/ci_failed.html" 'failed: build · after merging main into it'
+}
+
+test_ci_failures_are_not_followed_by_default() {
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  checks 'acme/api#7' '' 'test:FAILURE'
+  watcher run
+  watcher run
+  assert_rc 0
+  assert_lacks "$GH_CALLS" '/commits/'
+  assert_notified 0
+  assert_json "$STATE_DIR/updates.json" '. == {}'
+}
+
+test_notify_ci_failed_config_and_flags() {
+  watcher install --dry-run --notify-ci-failed
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^NOTIFY_CI_FAILED=true$' 1
+  config NOTIFY_CI_FAILED=yes
+  watcher run
+  assert_rc 1
+  assert_log 'NOTIFY_CI_FAILED must be true or false'
+  config NOTIFY_CI_FAILED=true
+  watcher doctor --json
+  assert_json "$SANDBOX/out" '.checks[] | select(.id == "notifications") | .message
+    == "notifies: conflicts, reviews that request changes, CI failing after an update"'
+}
+
 # ── run --dry-run ──────────────────────────────────────────────────────────────────────────────
 
 test_dry_run_changes_nothing() {
   search_prs 'acme/api#7' 'acme/api#8'
   pr 'acme/api#7' MERGEABLE 3
   pr 'acme/api#8' CONFLICTING 1
+  review 'acme/api#7' CHANGES_REQUESTED bob
   watcher run --dry-run
   assert_rc 0
   assert_lacks "$GH_CALLS" 'update-branch'
   assert_notified 0
   assert_log 'acme/api#7: 3 behind → \(dry-run\) would update the branch'
   assert_log '\(dry-run\) would notify: api#8 · conflict needs attention'
+  assert_log '\(dry-run\) would notify: api#7 · changes requested'
   local f
-  for f in state.json conflicts.json conflicts.html conflicts_reminded.json last_run last_error; do
+  for f in state.json conflicts.json conflicts.html conflicts_reminded.json changes_requested.json \
+    changes_requested.html updates.json ci_failed.html last_actions.json last_run last_error; do
     assert_no_file "$STATE_DIR/$f"
   done
+}
+
+# ── list ───────────────────────────────────────────────────────────────────────────────────────
+
+test_list_puts_what_needs_you_first() {
+  search_prs 'acme/api#1' 'acme/api#2' 'acme/api#3' 'acme/api#4' 'acme/api#5'
+  pr 'acme/api#1' MERGEABLE 0
+  pr 'acme/api#2' MERGEABLE 3
+  pr 'acme/api#3' CONFLICTING 5
+  pr 'acme/api#4' MERGEABLE 0
+  review 'acme/api#4' CHANGES_REQUESTED bob
+  pr 'acme/api#5' MERGEABLE 0
+  checks 'acme/api#5' '' 'lint:SUCCESS' 'test:FAILURE'
+  checks 'acme/api#1' '' 'lint:SUCCESS'
+  review 'acme/api#1' APPROVED
+  watcher list
+  assert_rc 0
+  [ "$(awk 'NR > 1 {printf "%s ", $2}' "$SANDBOX/out")" = "#3 #4 #5 #2 #1 " ] \
+    || fail "rows out of order: $(awk 'NR > 1 {printf "%s ", $2}' "$SANDBOX/out")"
+  assert_has "$SANDBOX/out" '^REPO +PR +STATE +CI +REVIEWS +LAST RUN +AGE +TITLE$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#3 +conflict +- +- +- +2h +PR 3$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#4 +up to date +- +changes requested +- +2h +PR 4$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#5 +up to date +failing +' 1
+  assert_has "$SANDBOX/out" '^acme/api +#2 +3 behind +' 1
+  assert_has "$SANDBOX/out" '^acme/api +#1 +up to date +passing +approved +' 1
+  # It only reads.
+  assert_lacks "$GH_CALLS" 'update-branch'
+  assert_notified 0
+  assert_no_file "$STATE_DIR/state.json"
+  assert_no_file "$STATE_DIR/last_run"
+  assert_no_file "$STATE_DIR/watcher.log"
+}
+
+test_list_shows_what_the_last_run_did() {
+  search_prs 'acme/api#7' 'acme/api#8' 'acme/api#9 draft'
+  pr 'acme/api#7' MERGEABLE 3
+  pr 'acme/api#8' CONFLICTING 1
+  watcher run
+  watcher list
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^acme/api +#7 +3 behind +- +- +3 behind → branch updated from main \(CI will run\) +2h +PR 7$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#8 +conflict +- +- +CONFLICT \(1 behind\) ' 1
+  assert_json "$STATE_DIR/last_actions.json" '.prs["acme/api#9"] == "draft, left alone"'
+}
+
+test_list_json_has_one_object_per_pr() {
+  search_prs 'acme/api#7' 'acme/web#9'
+  pr 'acme/api#7' MERGEABLE 2
+  checks 'acme/api#7' '' 'test:IN_PROGRESS'
+  pr_view 'acme/web#9' UNKNOWN
+  watcher list --json
+  assert_rc 0
+  assert_json "$SANDBOX/out" 'length == 2 and (map(.number) == [7, 9])'
+  assert_json "$SANDBOX/out" '.[0] | .repo == "acme/api" and .state == "behind" and .behind == 2 and .ci == "pending"
+    and .review == null and .last_run == null and .url == "https://github.com/acme/api/pull/7" and .title == "PR 7"'
+  assert_json "$SANDBOX/out" '.[1] | .state == "unknown" and .mergeable == "UNKNOWN"'
+}
+
+test_list_uses_the_same_filters_as_run() {
+  config 'REPOS=acme/api' SKIP_LABEL=no-autoupdate
+  search_prs 'acme/api#7' 'acme/api#8 draft' 'acme/api#9 label:no-autoupdate'
+  pr 'acme/api#7' MERGEABLE 0
+  watcher list --json
+  assert_rc 0
+  assert_has "$GH_CALLS" '^search prs .* --repo acme/api$' 1
+  assert_json "$SANDBOX/out" 'map(.number) == [7]'
+  search_prs
+  watcher list
+  assert_has "$SANDBOX/out" '^no open PRs$' 1
+  watcher list --wide
+  assert_rc 1
+  assert_has "$SANDBOX/out" 'error: unknown option for list: --wide' 1
 }
 
 # ── run: errors ────────────────────────────────────────────────────────────────────────────────
@@ -332,7 +665,9 @@ for t in $(declare -F | awk '{print $3}' | grep '^test_'); do
   [ -z "${1:-}" ] || [[ "$t" == *$1* ]] || continue
   if (
     setup
-    out=$("$t")
+    # A test that aborts (an unset variable, a failing helper) fails too, with what it said.
+    out=$("$t" 2>&1) || out="${out:+$out
+}    ✗ the test aborted (exit $?)"
     if [ -z "$out" ]; then rm -rf "$SANDBOX"; exit 0; fi
     printf '✗ %s\n%s\n    sandbox: %s\n' "${t#test_}" "$out" "$SANDBOX"
     exit 1

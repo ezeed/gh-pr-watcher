@@ -18,6 +18,8 @@ repos and, for each one:
 | Mergeable and up to date | Nothing. |
 | Conflicting | Notification while it stays conflicting, grouped with the other conflicting PRs: at most once an hour, and right away when a new one shows up or the list changes. |
 | GitHub still computing mergeability | Retries for a few seconds; otherwise it waits for the next run. |
+| A review moves it to changes requested | One notification, once (unless `NOTIFY_CHANGES_REQUESTED=false`). Independent of the rows above. |
+| CI fails on a branch the watcher updated | One notification, once (only with `NOTIFY_CI_FAILED=true`). Not for the person's own pushes. |
 
 - **It does not resolve conflicts.** If GitHub's three-way merge applies cleanly, it updates the
   branch; if a single line clashes, it only notifies. When the PR becomes mergeable again there is
@@ -34,7 +36,7 @@ repos and, for each one:
   day (`EVERY_MINUTES`): a shorter interval batches fewer merges into one update.
 - `gh` reads its token from the keychain, which works under launchd.
 
-There are only two notifications, and they are not configurable:
+There are four notifications; the conflict and stopped-working ones can't be turned off:
 
 - **Conflict:** one notification for all conflicting PRs, replacing the previous one, repeated at most
   once an hour unless a new one shows up or the list changes.
@@ -42,6 +44,18 @@ There are only two notifications, and they are not configurable:
   clicking it opens the PR. With several, `N PRs with conflicts (M new)` listing them, and clicking
   it opens `~/.local/state/gh-pr-watcher/conflicts.html`, a page with a link to each one. When no
   conflict is left, the notification is removed.
+- **Changes requested** (`NOTIFY_CHANGES_REQUESTED`, on by default): when a review moves a PR to
+  changes requested, `<repo>#<n> · changes requested` with the title and who asked, opening the PR.
+  Several in the same run: `N PRs with changes requested`, opening
+  `~/.local/state/gh-pr-watcher/changes_requested.html`. Once per PR: it comes back only if the PR
+  leaves that state (approved, review dismissed) and changes are requested again. With the option
+  off, it still keeps track, so turning it on doesn't notify the old ones.
+- **CI failed** (`NOTIFY_CI_FAILED`, off by default): after updating a branch, the watcher remembers
+  the head it updated from. On later runs, if the new head is its own merge commit (two parents, the
+  first one that head), it reads that commit's checks: if any fails, `<repo>#<n> · CI failed after
+  the update` with the failing checks, opening the PR's checks tab; several in the same run open
+  `~/.local/state/gh-pr-watcher/ci_failed.html`. Once per update. If the person pushes in between or
+  on top, it stops following it. It stops after 24 h without a result too.
 - **Stopped working:** `stopped working · gh pr-watcher doctor`, with the error as the body (expired
   `gh` session, invalid config, an owner that doesn't exist). Clicking it opens the log. It isn't
   repeated while the error stays the same. A known transient failure (no network, a timeout,
@@ -80,7 +94,8 @@ It returns JSON like this:
   "repos_with_prs": ["AcmeCorp/api", "AcmeCorp/web", "ana/dotfiles"],
   "config": {"path": "...", "exists": false,
              "values": {"GH_USER": "", "OWNERS": "", "REPOS": "", "EVERY_MINUTES": 60,
-                        "INCLUDE_DRAFTS": false, "SKIP_LABEL": ""}},
+                        "INCLUDE_DRAFTS": false, "SKIP_LABEL": "",
+                        "NOTIFY_CHANGES_REQUESTED": true, "NOTIFY_CI_FAILED": false}},
   "installed": {"plist_exists": false, "agent_loaded": false, ...},
   "last_run_error": null,
   "other_watcher_agents": [],
@@ -108,7 +123,7 @@ Decide on your own, without asking, whatever `detect` settles:
 | A single account in `accounts` | Don't pass `--user`. |
 | No orgs in `orgs` | Don't pass `--owners`: it watches all the account's PRs. |
 | `repos_with_prs` falls entirely within one org | `--owners <org>`. |
-| The person didn't mention frequency, drafts or label | The defaults: every 6 h, no drafts, no label. |
+| The person didn't mention frequency, drafts, label or notifications | The defaults: every hour, no drafts, no label, changes-requested notification on, CI-failed off. |
 
 Ask the person, in a single question with the options from `detect` in view:
 
@@ -119,7 +134,9 @@ Ask the person, in a single question with the options from `detect` in view:
   it without their OK.
 - **Whether the CI cost is fine**, when it will watch shared repos (see "What it does").
 
-Don't ask about notifications: the conflict notification is always on and not configurable.
+Don't ask about notifications: the conflict one is always on, and the changes-requested one stays on
+unless the person says they don't want it (`--no-notify-changes-requested`). The CI-failed one stays
+off unless they ask for it (`--notify-ci-failed`).
 
 ## 4. Install
 
@@ -139,6 +156,8 @@ gh pr-watcher install           --owners "AcmeCorp" --every 1h --no-drafts --no-
 | `--drafts` / `--no-drafts` | `INCLUDE_DRAFTS` | |
 | `--skip-label L` / `--no-skip-label` | `SKIP_LABEL` | The convention is `no-autoupdate`. |
 | `--notify-image PATH` | `NOTIFY_IMAGE` | Image attached to notifications. `""` = the bundled one. |
+| `--notify-changes-requested` / `--no-notify-changes-requested` | `NOTIFY_CHANGES_REQUESTED` | Default on. |
+| `--notify-ci-failed` / `--no-notify-ci-failed` | `NOTIFY_CI_FAILED` | Default off. |
 
 `install` validates before writing anything: the format of each value, that the `gh` session is
 valid and has the `repo` scope, and that every owner and repo exists. If something fails, nothing
@@ -158,6 +177,9 @@ gh pr-watcher run --dry-run     # lists which PRs it would update, without touch
 Right after installing, the `last_run` check says `not due to run yet (next: … h)`: that's expected.
 
 `run --dry-run` doesn't update branches, notify or save state: you can run it without asking.
+`list --json` neither: it gives, per PR, `state` (`conflict`, `behind`, `up_to_date`, `unknown`),
+`behind`, `ci` (`failing`, `pending`, `passing` or null), `failed_checks`, `review`, `last_run` (what
+the last run did to it) and `created_at`, with the ones that need the person first.
 `test-notify` does send a notification (to check that macOS shows them): ask first.
 
 ## Errors
@@ -175,7 +197,7 @@ gh pr-watcher doctor --json
 ]}
 ```
 
-Check ids: `gh`, `jq`, `config`, `session`, `targets`, `agent`, `last_run`. `status` is `ok`,
+Check ids: `gh`, `jq`, `config`, `notifications`, `session`, `targets`, `agent`, `last_run`. `status` is `ok`,
 `warn` (works, with a caveat) or `fail`. The fix is in `fix`, or inside `message` when the message
 already carries the command. `doctor` changes nothing and doesn't notify: you can run it without
 asking. Applying a `fix` does change things: ask for permission as with `install`.

@@ -23,7 +23,9 @@
 
 Hace lo mismo que el botón **"Update branch"** de GitHub, pero por vos y en todos tus PRs a la vez.
 No hace falta cambiar nada en el repo: ni Actions, ni bots, ni permisos nuevos. Nunca resuelve
-conflictos, no hace rebase ni fuerza nada: cuando un PR entra en conflicto, solo te avisa.
+conflictos, no hace rebase ni fuerza nada: cuando un PR entra en conflicto, solo te avisa. También
+te avisa, una vez, cuando un review pide cambios y, si lo activás, cuando falla el CI en una rama que
+actualizó.
 
 Pensado para repos con la regla *"Require branches to be up to date before merging"*: cada merge a
 la base deja atrasados a todos los PRs abiertos, y hay que actualizarlos uno por uno antes de mergear.
@@ -92,6 +94,8 @@ para reprogramar.
 | `INCLUDE_DRAFTS` | `false` | `true` = también actualiza los drafts. |
 | `SKIP_LABEL` | *(vacío)* | Los PRs con esta etiqueta no se tocan. El instalador ofrece `no-autoupdate`; en el archivo podés poner cualquiera. |
 | `NOTIFY_IMAGE` | *(el logo)* | Imagen local (PNG o JPG) que va a la derecha de la notificación. Solo con `terminal-notifier`. El ícono de la izquierda no se puede cambiar: macOS lo toma de la app que notifica. |
+| `NOTIFY_CHANGES_REQUESTED` | `true` | `true` = una notificación cuando un review deja un PR en *changes requested*. No se repite mientras siga así; si lo aprueban y vuelven a pedir cambios, avisa de nuevo. |
+| `NOTIFY_CI_FAILED` | `false` | `true` = una notificación cuando falla el CI en una rama que actualizó el watcher. Solo sobre su propio merge commit: si pusheás en el medio o encima, deja de seguirlo. También deja de seguirlo a las 24 h sin resultado. |
 
 Una clave mal escrita (`OWNER=`) o una línea que no es `KEY=VALUE` no se ignora en silencio: se
 avisa, con una sugerencia si se parece a una clave real. `install` además verifica que cada owner
@@ -100,7 +104,8 @@ y cada repo existan y que tu cuenta los vea.
 El log y el estado quedan en `~/.local/state/gh-pr-watcher/`. Mientras un PR siga en conflicto,
 te lo recuerda como mucho una vez por hora (en el momento si aparece uno nuevo o cambia la lista): una sola notificación para todos, que abre el PR si hay uno o una
 página local con la lista si hay varios. El estado solo recuerda desde cuándo está abierto cada
-conflicto: borrarlo es inocuo. Cada log guarda sus últimas 2000 líneas (de días a un mes, según la frecuencia y
+conflicto: borrarlo es inocuo. Los reviews que piden cambios siguen el mismo esquema (una
+notificación, o una página si llegan varios en la misma vuelta), pero una sola vez por PR; lo mismo vale para el CI que falla después de una actualización. Cada log guarda sus últimas 2000 líneas (de días a un mes, según la frecuencia y
 cuántos PRs haya abiertos); las anteriores se descartan en cada vuelta.
 
 ## Comandos
@@ -109,6 +114,7 @@ cuántos PRs haya abiertos); las anteriores se descartan en cada vuelta.
 |---|---|
 | `install [opciones]` | Guarda la config y programa la corrida (launchd en macOS; en Linux imprime la línea de `crontab`). Sin opciones y con terminal, pregunta. |
 | `run [--dry-run]` | Corre una vuelta ahora. Con `--dry-run` informa qué haría, sin actualizar ramas, sin notificar y sin guardar estado. |
+| `list [--json]` | Tus PRs abiertos como los ve una vuelta (mismos filtros), primero los que te necesitan: conflicto, cambios pedidos, CI fallando, atrasados, al día. Muestra estado, CI, reviews, qué hizo la última vuelta, antigüedad y título. No cambia nada. `--json` da un objeto por PR. |
 | `status [--json]` | Config, si el agente está cargado, la última vuelta, el último error y el final del log. |
 | `doctor [--json]` | Revisa todo lo que hace falta para que una vuelta ande y dice cómo arreglar cada problema. No cambia nada. |
 | `log [N]` | Las últimas N líneas del log (30 por default). |
@@ -135,6 +141,8 @@ pisan la config que ya tenías y lo que falte sale de los defaults.
 | `--drafts` · `--no-drafts` | Actualiza o no los drafts (`INCLUDE_DRAFTS`). |
 | `--skip-label L` · `--no-skip-label` | Excluye o no los PRs con la etiqueta L (`SKIP_LABEL`). |
 | `--notify-image PATH` | Imagen de las notificaciones (`NOTIFY_IMAGE`). `""` = el logo. |
+| `--notify-changes-requested` · `--no-notify-changes-requested` | Avisa o no cuando un review pide cambios (`NOTIFY_CHANGES_REQUESTED`). |
+| `--notify-ci-failed` · `--no-notify-ci-failed` | Avisa o no cuando falla el CI en una rama que actualizó (`NOTIFY_CI_FAILED`). |
 | `--yes` | No pregunta: usa la config existente y los defaults. Sirve para reprogramar después de editar el archivo. |
 | `--dry-run` | Muestra la config y el LaunchAgent que escribiría, sin tocar nada. Sola, igual hace las preguntas. |
 
