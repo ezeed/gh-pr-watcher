@@ -55,7 +55,23 @@ pr_view() {
   fixture "$key" "$(jq -n --arg r "$repo" --argjson n "$num" --arg m "$2" '{
     mergeable: $m, headRefOid: "head-\($n)", headRefName: "feat-\($n)",
     headRepositoryOwner: {login: "ana"}, baseRefName: "main",
-    url: "https://github.com/\($r)/pull/\($n)", title: "PR \($n)"}')"
+    url: "https://github.com/\($r)/pull/\($n)", title: "PR \($n)",
+    reviewDecision: "", latestReviews: []}')"
+}
+
+# review o/r#N DECISION [REVIEWER] [call]: the PR's reviewDecision, with REVIEWER's latest review
+# in that state, on every call or only on that call number. Goes after pr or pr_view.
+review() {
+  local repo="${1%#*}" num="${1#*#}" base f
+  base="$FIXTURES/$(fixture_key "pr_view_${repo}_$num")"
+  f="$base.json"
+  if [ -n "${4:-}" ]; then
+    f="$base.$4.json"
+    [ -f "$f" ] || cp "$base.json" "$f"
+  fi
+  jq --arg d "$2" --arg by "${3:-}" '.reviewDecision = $d
+    | .latestReviews = (if $by == "" then [] else [{author: {login: $by}, state: $d}] end)' "$f" >"$f.tmp"
+  mv "$f.tmp" "$f"
 }
 
 # behind o/r#N COMMITS: how far the head is behind main.
@@ -278,20 +294,113 @@ test_search_uses_owners_or_repos() {
   assert_lacks "$GH_CALLS" '^search prs .*--owner acme$'
 }
 
+# ── run: reviews that request changes ──────────────────────────────────────────────────────────
+
+test_changes_requested_notifies_once() {
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  review 'acme/api#7' CHANGES_REQUESTED bob
+  watcher run
+  assert_rc 0
+  assert_has "$NOTIFY_CALLS" '-subtitle api#7 · changes requested -message PR 7 · by bob -open https://github.com/acme/api/pull/7 .*-group gh-pr-watcher-changes' 1
+  assert_log 'acme/api#7: changes requested by bob'
+  assert_json "$STATE_DIR/changes_requested.json" 'length == 1 and .[0].key == "acme/api#7" and .[0].by == "bob"'
+
+  age 3600
+  watcher run
+  assert_notified 1
+  watcher status --json
+  assert_json "$SANDBOX/out" '.changes_requested[0].key == "acme/api#7" and .config.values.NOTIFY_CHANGES_REQUESTED == true'
+}
+
+test_changes_requested_on_several_prs_share_a_page() {
+  search_prs 'acme/api#7' 'acme/web#9'
+  pr 'acme/api#7' MERGEABLE 0
+  pr 'acme/web#9' CONFLICTING 2
+  review 'acme/api#7' CHANGES_REQUESTED bob
+  review 'acme/web#9' CHANGES_REQUESTED carol
+  watcher run
+  assert_rc 0
+  assert_has "$NOTIFY_CALLS" "-subtitle 2 PRs with changes requested -message api#7, web#9 -open file://$STATE_DIR/changes_requested.html" 1
+  assert_has "$STATE_DIR/changes_requested.html" 'changes requested by carol'
+  # The conflict keeps its own notification.
+  assert_has "$NOTIFY_CALLS" '-subtitle web#9 · conflict needs attention' 1
+}
+
+test_changes_requested_again_after_approval_notifies_again() {
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  review 'acme/api#7' CHANGES_REQUESTED bob 1
+  review 'acme/api#7' APPROVED bob 2
+  review 'acme/api#7' CHANGES_REQUESTED carol 3
+  watcher run
+  watcher run
+  assert_log 'acme/api#7: changes no longer requested'
+  assert_json "$STATE_DIR/changes_requested.json" 'length == 0'
+  watcher run
+  assert_notified 2
+  assert_has "$NOTIFY_CALLS" '-message PR 7 · by carol ' 1
+}
+
+test_changes_requested_kept_when_the_pr_cant_be_read() {
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  review 'acme/api#7' CHANGES_REQUESTED bob 1
+  fixture_err pr_view_acme/api_7 'HTTP 502: Bad Gateway'
+  rm "$FIXTURES/$(fixture_key pr_view_acme/api_7).json"
+  watcher run
+  watcher run
+  assert_log 'acme/api#7: could not read the PR'
+  assert_json "$STATE_DIR/changes_requested.json" 'length == 1'
+  assert_notified 1
+}
+
+test_changes_requested_not_notified_when_off() {
+  config NOTIFY_CHANGES_REQUESTED=false
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  review 'acme/api#7' CHANGES_REQUESTED bob
+  watcher run
+  assert_rc 0
+  assert_notified 0
+  assert_log '1 PR\(s\) with changes requested, not notified \(NOTIFY_CHANGES_REQUESTED=false\)'
+  assert_json "$STATE_DIR/changes_requested.json" 'length == 1'
+}
+
+test_notify_changes_requested_config_and_flags() {
+  watcher install --dry-run --no-notify-changes-requested
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^NOTIFY_CHANGES_REQUESTED=false$' 1
+  watcher install --dry-run --notify-changes-requested
+  assert_has "$SANDBOX/out" '^NOTIFY_CHANGES_REQUESTED=true$' 1
+
+  config NOTIFY_CHANGES_REQUESTED=maybe
+  watcher run
+  assert_rc 1
+  assert_log 'NOTIFY_CHANGES_REQUESTED must be true or false'
+
+  config NOTIFY_CHANGES_REQUESTED=false
+  watcher doctor --json
+  assert_json "$SANDBOX/out" '.checks[] | select(.id == "notifications") | .message | test("conflicts only")'
+}
+
 # ── run --dry-run ──────────────────────────────────────────────────────────────────────────────
 
 test_dry_run_changes_nothing() {
   search_prs 'acme/api#7' 'acme/api#8'
   pr 'acme/api#7' MERGEABLE 3
   pr 'acme/api#8' CONFLICTING 1
+  review 'acme/api#7' CHANGES_REQUESTED bob
   watcher run --dry-run
   assert_rc 0
   assert_lacks "$GH_CALLS" 'update-branch'
   assert_notified 0
   assert_log 'acme/api#7: 3 behind → \(dry-run\) would update the branch'
   assert_log '\(dry-run\) would notify: api#8 · conflict needs attention'
+  assert_log '\(dry-run\) would notify: api#7 · changes requested'
   local f
-  for f in state.json conflicts.json conflicts.html conflicts_reminded.json last_run last_error; do
+  for f in state.json conflicts.json conflicts.html conflicts_reminded.json changes_requested.json \
+    changes_requested.html last_run last_error; do
     assert_no_file "$STATE_DIR/$f"
   done
 }
