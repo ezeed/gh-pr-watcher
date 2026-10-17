@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake terminal-notifier: logs each call's arguments, one per line, to $NOTIFY_CALLS.
+printf '%s\n' "$*" >>"$NOTIFY_CALLS"

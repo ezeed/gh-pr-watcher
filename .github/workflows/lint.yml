@@ -10,4 +10,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash -n gh-pr-watcher
-      - run: shellcheck gh-pr-watcher
+      - run: shellcheck gh-pr-watcher tests/run_tests.sh tests/bin/*
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/run_tests.sh

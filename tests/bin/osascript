@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake osascript: logs the call to $NOTIFY_CALLS and swallows the script on stdin.
+printf 'osascript %s\n' "$*" >>"$NOTIFY_CALLS"
+cat >/dev/null

@@ -169,6 +169,18 @@ gh pr-watcher uninstall && gh extension remove pr-watcher
 `uninstall` keeps the config and the log; to start from scratch, also delete
 `~/.config/gh-pr-watcher` and `~/.local/state/gh-pr-watcher`.
 
+## Development
+
+```bash
+tests/run_tests.sh            # all the tests
+tests/run_tests.sh conflict   # only those whose name contains "conflict"
+```
+
+The tests run the script against fakes of `gh`, `terminal-notifier`, `osascript`, `launchctl` and
+`sleep` (in `tests/bin/`, placed first in `PATH`) that answer from JSON fixtures: no network, no
+`gh` session, and nothing touched outside a temp folder. Only `jq` is needed. CI runs them on Linux
+and macOS, plus `shellcheck`.
+
 ## License
 
 [MIT](LICENSE).

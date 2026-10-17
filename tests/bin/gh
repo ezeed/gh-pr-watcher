@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Fake gh for the tests: logs each call to $GH_CALLS and answers from the files in $FIXTURES.
+#
+# Each call maps to a key (non [A-Za-z0-9._-] characters become "_"):
+#   gh auth status ...          auth_status
+#   gh search prs ...           search_prs
+#   gh pr view N -R o/r ...     pr_view_o_r_N
+#   gh api [-X M] PATH ...      api_M_PATH (GET by default)
+# and is answered with the first file found among $key.<n>.json, $key.<n>.err, $key.json and
+# $key.err, where n counts the calls with that key (1, 2...). A .json goes to stdout (through
+# --jq if given), a .err to stderr with exit 1. With no file, it fails like an HTTP 404.
+set -uo pipefail
+
+printf '%s\n' "$*" >>"$GH_CALLS"
+
+jq_filter="" method=GET repo="" args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --jq) jq_filter="$2"; shift ;;
+    -X|--method) method="$2"; shift ;;
+    -R|--repo) repo="$2"; shift ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+set -- ${args[@]+"${args[@]}"}
+
+case "${1:-} ${2:-}" in
+  "auth status")
+    case " $* " in *" --help "*) echo "  --json fields   Output JSON with the specified fields"; exit 0 ;; esac
+    key=auth_status ;;
+  "search prs") key=search_prs ;;
+  "pr view") key="pr_view_${repo}_${3:-}" ;;
+  api\ *) key="api_${method}_$2" ;;
+  *) echo "fake gh: unsupported call: $*" >&2; exit 2 ;;
+esac
+key=$(printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_')
+
+count_file="$FIXTURES/.count_$key"
+n=$(($(cat "$count_file" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$count_file"
+
+for f in "$key.$n.json" "$key.$n.err" "$key.json" "$key.err"; do
+  [ -f "$FIXTURES/$f" ] || continue
+  case "$f" in
+    *.err) cat "$FIXTURES/$f" >&2; exit 1 ;;
+    *) if [ -n "$jq_filter" ]; then jq -r "$jq_filter" "$FIXTURES/$f"; else cat "$FIXTURES/$f"; fi
+       exit 0 ;;
+  esac
+done
+echo "HTTP 404: Not Found (fake gh has no fixture for $key)" >&2
+exit 1
