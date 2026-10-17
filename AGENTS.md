@@ -177,6 +177,9 @@ gh pr-watcher run --dry-run     # lists which PRs it would update, without touch
 Right after installing, the `last_run` check says `not due to run yet (next: … h)`: that's expected.
 
 `run --dry-run` doesn't update branches, notify or save state: you can run it without asking.
+`list --json` neither: it gives, per PR, `state` (`conflict`, `behind`, `up_to_date`, `unknown`),
+`behind`, `ci` (`failing`, `pending`, `passing` or null), `failed_checks`, `review`, `last_run` (what
+the last run did to it) and `created_at`, with the ones that need the person first.
 `test-notify` does send a notification (to check that macOS shows them): ask first.
 
 ## Errors

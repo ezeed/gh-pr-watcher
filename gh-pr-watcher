@@ -17,6 +17,7 @@ REMINDED="$STATE_DIR/conflicts_reminded.json"
 CHANGES="$STATE_DIR/changes_requested.json"
 CHANGES_PAGE="$STATE_DIR/changes_requested.html"
 UPDATES="$STATE_DIR/updates.json"
+LAST_ACTIONS="$STATE_DIR/last_actions.json"
 CI_PAGE="$STATE_DIR/ci_failed.html"
 LOG="$STATE_DIR/watcher.log"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -84,6 +85,8 @@ Commands:
                           orgs, repos with your PRs, dependencies, current config and install.
   run [--dry-run]         One run now. --dry-run reports without updating branches,
                           notifying or saving state.
+  list [--json]           Your open PRs as a run sees them, the ones that need you first:
+                          state, CI, reviews and what the last run did. Changes nothing.
   test-notify             Sends a test notification.
   doctor [--json]         Checks dependencies, session, config, schedule and the last
                           run, with the fix for each problem. Changes nothing.
@@ -478,7 +481,7 @@ follow_update() {
       return 0
     fi
     if [ "$(wc -w <<<"$parents" | tr -d ' ')" != "2" ] || [ "${parents%% *}" != "$from" ]; then
-      log "$key: the head moved by a push of yours, not following its CI"
+      did "$key" "the head moved by a push of yours, not following its CI"
       return 0
     fi
     sha="$oid"
@@ -490,9 +493,9 @@ follow_update() {
     | .name // .context] | unique | join(", ")' <<<"$info")
   if [ -n "$failed" ]; then
     if jq -e '.failed' <<<"$entry" >/dev/null; then
-      log "$key: CI still failing on the watcher's update ($failed)"
+      did "$key" "CI still failing on the watcher's update ($failed)"
     else
-      log "$key: CI failed on the watcher's update ($failed)"
+      did "$key" "CI failed on the watcher's update ($failed)"
     fi
     ci_failed=$(jq --arg k "$key" --arg t "$title" --arg u "$url" --arg f "$failed" --arg b "$base" \
       --argjson fresh "$(jq '.failed | not' <<<"$entry")" \
@@ -504,7 +507,7 @@ follow_update() {
       (.__typename == "CheckRun" and .status != "COMPLETED")
       or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED")))] | length' <<<"$info")
   if [ "$pending" = "0" ] && [ "$(jq '.statusCheckRollup | length' <<<"$info")" != "0" ]; then
-    log "$key: CI passed on the watcher's update"
+    did "$key" "CI passed on the watcher's update"
   elif [ $((now - $(jq -r '.at // 0' <<<"$entry"))) -lt "$FOLLOW_UPDATE_SEC" ]; then
     keep_update "$entry"
   fi
@@ -588,6 +591,55 @@ notify_conflicts() { # conflicts_json dry_run
   jq -n --argjson at "$now" --arg keys "$keys" '{at: $at, keys: $keys}' >"$REMINDED"
 }
 
+# The search a run makes, in SEARCH_ARGS (a function can't return an array, and gh_fail must
+# run in the caller's shell to stop it).
+search_args() {
+  SEARCH_ARGS=(search prs --author @me --state open --limit 100
+    --json "repository,number,isDraft,labels,title,url")
+  local o r
+  # gh search ANDs --owner and --repo: when repos are chosen, orgs are not passed.
+  if [ -n "$REPOS" ]; then
+    for r in $REPOS; do SEARCH_ARGS+=(--repo "$r"); done
+  else
+    for o in $OWNERS; do SEARCH_ARGS+=(--owner "$o"); done
+  fi
+}
+
+# "owner/repo number" for each PR of the search a run looks at: no drafts or skip label, per config.
+watched_prs() { # search_json
+  jq -r --arg skip "$SKIP_LABEL" --argjson drafts "$INCLUDE_DRAFTS" '
+    .[] | select($drafts or (.isDraft | not))
+        | select($skip == "" or ([.labels[].name] | index($skip) | not))
+        | "\(.repository.nameWithOwner) \(.number)"' <<<"$1"
+}
+
+PR_FIELDS="mergeable,headRefOid,headRefName,headRepositoryOwner,baseRefName,url,title,createdAt,reviewDecision,latestReviews,statusCheckRollup"
+
+# The PR as JSON; empty if it can't be read. GitHub computes mergeable lazily: the first query
+# usually returns UNKNOWN, so it asks again a few times.
+view_pr() { # repo num
+  local info attempt
+  for attempt in 1 2 3 4; do
+    info=$(gh pr view "$2" -R "$1" --json "$PR_FIELDS" 2>/dev/null) || info=""
+    [ -n "$info" ] || break
+    [ "$(jq -r .mergeable <<<"$info")" != "UNKNOWN" ] && break
+    sleep $((attempt * 5))
+  done
+  printf '%s' "$info"
+}
+
+# Logs what the run did to the PR and keeps it for list. Uses cmd_run's actions.
+did() { # key message
+  log "$1: $2"
+  actions=$(jq --arg k "$1" --arg d "$2" '.[$k] = $d' <<<"$actions")
+}
+
+save_actions() {
+  [ "$1" = "0" ] || return 0
+  jq -n --argjson now "$now" --argjson prs "$actions" '{at: $now, prs: $prs}' >"$LAST_ACTIONS.tmp.$$" \
+    && mv -f "$LAST_ACTIONS.tmp.$$" "$LAST_ACTIONS"
+}
+
 cmd_run() {
   local dry_run=0
   while [ $# -gt 0 ]; do
@@ -637,65 +689,45 @@ cmd_run() {
       || old_changes='{}'
   fi
 
-  local args=(search prs --author @me --state open --limit 100
-    --json "repository,number,isDraft,labels,title,url")
-  local o r
-  # gh search ANDs --owner and --repo: when repos are chosen, orgs are not passed.
-  if [ -n "$REPOS" ]; then
-    for r in $REPOS; do args+=(--repo "$r"); done
-  else
-    for o in $OWNERS; do args+=(--owner "$o"); done
-  fi
-
   local found
-  found=$(ghq "${args[@]}") || gh_fail "the PR search on GitHub failed"
+  search_args
+  found=$(ghq "${SEARCH_ARGS[@]}") || gh_fail "the PR search on GitHub failed"
 
   local prs
-  prs=$(jq -r --arg skip "$SKIP_LABEL" --argjson drafts "$INCLUDE_DRAFTS" '
-    .[] | select($drafts or (.isDraft | not))
-        | select($skip == "" or ([.labels[].name] | index($skip) | not))
-        | "\(.repository.nameWithOwner) \(.number)"' <<<"$found")
+  prs=$(watched_prs "$found")
 
-  local skipped
+  local skipped actions='{}' skipped_key skipped_why
   skipped=$(jq -r --arg skip "$SKIP_LABEL" --argjson drafts "$INCLUDE_DRAFTS" '
-    .[] | if (.isDraft and ($drafts | not)) then "\(.repository.nameWithOwner)#\(.number): draft, left alone"
-          elif ($skip != "" and ([.labels[].name] | index($skip))) then "\(.repository.nameWithOwner)#\(.number): label \($skip), left alone"
+    .[] | if (.isDraft and ($drafts | not)) then "\(.repository.nameWithOwner)#\(.number)\tdraft, left alone"
+          elif ($skip != "" and ([.labels[].name] | index($skip))) then "\(.repository.nameWithOwner)#\(.number)\tlabel \($skip), left alone"
           else empty end' <<<"$found")
-  [ -n "$skipped" ] && while read -r line; do log "$line"; done <<<"$skipped"
+  [ -n "$skipped" ] && while IFS=$'\t' read -r skipped_key skipped_why; do did "$skipped_key" "$skipped_why"; done <<<"$skipped"
 
   if [ -z "$prs" ]; then
     # The state is not wiped: with the wrong account the search comes back empty, and switching
     # back to the right one would repeat the notifications. Every run with PRs rebuilds it anyway.
     [ -z "$skipped" ] && log "no open PRs"
+    save_actions "$dry_run"
     run_ok
     return 0
   fi
 
-  local new_state='{}' conflicts='[]' changes='[]' updates='{}' ci_failed='[]' repo num key prev info mergeable attempt
+  local new_state='{}' conflicts='[]' changes='[]' updates='{}' ci_failed='[]' repo num key prev info mergeable
   local oid head head_owner base url title behind out review by
   while read -r repo num; do
     key="$repo#$num"
     prev=$(jq -r --arg k "$key" '.[$k] // ""' <<<"$old_state")
 
-    # GitHub computes mergeable lazily: the first query usually returns UNKNOWN.
-    info=""
-    for attempt in 1 2 3 4; do
-      info=$(gh pr view "$num" -R "$repo" \
-        --json mergeable,headRefOid,headRefName,headRepositoryOwner,baseRefName,url,title,reviewDecision,latestReviews,statusCheckRollup \
-        2>/dev/null) || info=""
-      [ -n "$info" ] || break
-      mergeable=$(jq -r .mergeable <<<"$info")
-      [ "$mergeable" != "UNKNOWN" ] && break
-      sleep $((attempt * 5))
-    done
+    info=$(view_pr "$repo" "$num")
     if [ -z "$info" ]; then
-      log "$key: could not read the PR, will retry next run"
+      did "$key" "could not read the PR, will retry next run"
       keep_prev
       changes=$(jq --arg k "$key" --argjson old "$old_changes" 'if $old[$k] then . + [$old[$k]] else . end' <<<"$changes")
       updates=$(jq --arg k "$key" --argjson old "$old_updates" 'if $old[$k] then .[$k] = $old[$k] else . end' <<<"$updates")
       continue
     fi
 
+    mergeable=$(jq -r .mergeable <<<"$info")
     oid=$(jq -r .headRefOid <<<"$info")
     head=$(jq -r .headRefName <<<"$info")
     head_owner=$(jq -r .headRepositoryOwner.login <<<"$info")
@@ -707,20 +739,20 @@ cmd_run() {
     review=$(jq -r '.reviewDecision // ""' <<<"$info")
     if [ "$review" = "CHANGES_REQUESTED" ]; then
       by=$(jq -r '[.latestReviews[]? | select(.state == "CHANGES_REQUESTED") | .author.login // empty] | unique | join(", ")' <<<"$info")
-      jq -e --arg k "$key" 'has($k)' <<<"$old_changes" >/dev/null || log "$key: changes requested${by:+ by $by}"
+      jq -e --arg k "$key" 'has($k)' <<<"$old_changes" >/dev/null || did "$key" "changes requested${by:+ by $by}"
       changes=$(jq --arg k "$key" --arg t "$title" --arg u "$url" --arg by "$by" --argjson now "$now" \
         --argjson old "$old_changes" '. + [{key: $k, title: $t, url: $u, by: $by, since: ($old[$k].since // $now)}]' <<<"$changes")
     elif jq -e --arg k "$key" 'has($k)' <<<"$old_changes" >/dev/null; then
-      log "$key: changes no longer requested"
+      did "$key" "changes no longer requested"
     fi
     [ "$NOTIFY_CI_FAILED" = "true" ] && follow_update
 
     case "$mergeable" in
       CONFLICTING)
         if [ "$prev" != "CONFLICTING" ]; then
-          log "$key: CONFLICT ($behind behind)"
+          did "$key" "CONFLICT ($behind behind)"
         else
-          log "$key: still conflicting ($behind behind)"
+          did "$key" "still conflicting ($behind behind)"
         fi
         new_state=$(jq --arg k "$key" '.[$k]="CONFLICTING"' <<<"$new_state")
         conflicts=$(jq --arg k "$key" --arg t "$title" --arg u "$url" --arg b "$behind" --arg base "$base" \
@@ -728,21 +760,21 @@ cmd_run() {
           '. + [{key: $k, title: $t, url: $u, behind: $b, base: $base, since: ($old[$k].since // $now)}]' <<<"$conflicts") ;;
       MERGEABLE)
         if [ "$prev" = "CONFLICTING" ]; then
-          log "$key: conflict resolved"
+          did "$key" "conflict resolved"
         fi
         if [ "$behind" = "0" ]; then
-          log "$key: up to date"
+          did "$key" "up to date"
         elif [ "$dry_run" = "1" ]; then
-          log "$key: $behind behind → (dry-run) would update the branch"
+          did "$key" "$behind behind → (dry-run) would update the branch"
         elif out=$(gh api -X PUT "repos/$repo/pulls/$num/update-branch" -f expected_head_sha="$oid" 2>&1); then
-          log "$key: $behind behind → branch updated from $base (CI will run)"
+          did "$key" "$behind behind → branch updated from $base (CI will run)"
           [ "$NOTIFY_CI_FAILED" = "true" ] && keep_update "$(jq -cn --arg f "$oid" --argjson now "$now" '{from: $f, at: $now}')"
         else
-          log "$key: $behind behind, not updated: $(tr '\n' ' ' <<<"$out")"
+          did "$key" "$behind behind, not updated: $(tr '\n' ' ' <<<"$out")"
         fi
         new_state=$(jq --arg k "$key" '.[$k]="MERGEABLE"' <<<"$new_state") ;;
       *)
-        log "$key: GitHub is still computing mergeable ($mergeable), skipping this run"
+        did "$key" "GitHub is still computing mergeable ($mergeable), skipping this run"
         keep_prev ;;
     esac
   done <<<"$prs"
@@ -756,7 +788,94 @@ cmd_run() {
     printf '%s\n' "$changes" >"$CHANGES.tmp.$$" && mv -f "$CHANGES.tmp.$$" "$CHANGES"
     printf '%s\n' "$updates" >"$UPDATES.tmp.$$" && mv -f "$UPDATES.tmp.$$" "$UPDATES"
   fi
+  save_actions "$dry_run"
   run_ok
+}
+
+# One row per PR a run looks at, the ones that need you first. Reads only: no updates, no
+# notifications, no state, no lock.
+cmd_list() {
+  local json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      *) die "unknown option for list: $1" ;;
+    esac
+    shift
+  done
+  load_config
+  validate_config
+  require_jq
+  require_gh
+  require_session
+  use_account
+
+  local found prs repo num info behind last='{}' rows='[]'
+  search_args
+  found=$(ghq "${SEARCH_ARGS[@]}") || gh_fail "the PR search on GitHub failed"
+  prs=$(watched_prs "$found")
+  if [ -s "$LAST_ACTIONS" ]; then
+    last=$(jq -c '.prs // {} | if type == "object" then . else {} end' "$LAST_ACTIONS" 2>/dev/null) || last='{}'
+  fi
+
+  if [ -n "$prs" ]; then
+    while read -r repo num; do
+      info=$(view_pr "$repo" "$num")
+      behind=""
+      if [ -n "$info" ]; then
+        behind=$(gh api "repos/$repo/compare/$(jq -r .baseRefName <<<"$info")...$(jq -r .headRepositoryOwner.login <<<"$info"):$(jq -r .headRefName <<<"$info")" \
+          --jq .behind_by 2>/dev/null) || behind=""
+      else
+        info='{}'
+      fi
+      rows=$(jq --arg repo "$repo" --argjson num "$num" --arg behind "$behind" --argjson last "$last" --argjson info "$info" '
+        ($info.statusCheckRollup // []) as $checks
+        | ([$checks[] | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"))
+            | .name // .context] | unique) as $failed
+        | . + [{
+            repo: $repo, number: $num, title: ($info.title // ""), url: ($info.url // "https://github.com/\($repo)/pull/\($num)"),
+            mergeable: ($info.mergeable // null),
+            behind: (if $behind == "" then null else ($behind | tonumber) end),
+            ci: (if ($checks | length) == 0 then null
+                 elif ($failed | length) > 0 then "failing"
+                 elif any($checks[]; (.__typename == "CheckRun" and .status != "COMPLETED")
+                          or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED"))) then "pending"
+                 else "passing" end),
+            failed_checks: $failed,
+            review: (if ($info.reviewDecision // "") == "" then null else $info.reviewDecision end),
+            last_run: ($last["\($repo)#\($num)"] // null),
+            created_at: ($info.createdAt // null)}]' <<<"$rows")
+    done <<<"$prs"
+  fi
+
+  rows=$(jq 'map(.state = (if .mergeable == "CONFLICTING" then "conflict"
+                           elif .mergeable == "MERGEABLE" and .behind != null then (if .behind > 0 then "behind" else "up_to_date" end)
+                           else "unknown" end)
+           | .rank = (if .state == "conflict" then 0 elif .review == "CHANGES_REQUESTED" then 1 elif .ci == "failing" then 2
+                      elif .state == "behind" then 3 elif .state == "up_to_date" then 4 else 5 end))
+         | sort_by(.rank, .repo, .number) | map(del(.rank))' <<<"$rows")
+  if [ "$json" = "1" ]; then
+    printf '%s\n' "$rows"
+    return 0
+  fi
+  if [ "$(jq length <<<"$rows")" = "0" ]; then
+    echo "no open PRs"
+    return 0
+  fi
+  jq -r 'def pad($n): . + (" " * ($n - length) // "");
+    def age: (now - (fromdateiso8601? // now)) | floor
+      | if . < 3600 then "\(. / 60 | floor)m" elif . < 86400 then "\(. / 3600 | floor)h" else "\(. / 86400 | floor)d" end;
+    [["REPO", "PR", "STATE", "CI", "REVIEWS", "LAST RUN", "AGE", "TITLE"]]
+    + map([.repo, "#\(.number)",
+           (if .state == "conflict" then "conflict" elif .state == "behind" then "\(.behind) behind"
+            elif .state == "up_to_date" then "up to date" else "?" end),
+           (.ci // "-"),
+           ({APPROVED: "approved", CHANGES_REQUESTED: "changes requested", REVIEW_REQUIRED: "review required"}[.review // ""] // "-"),
+           (.last_run // "-"),
+           (if .created_at then (.created_at | age) else "-" end),
+           .title])
+    | (transpose | map(map(length) | max)) as $w
+    | .[] | [to_entries[] | .key as $i | if $i < 7 then (.value | pad($w[$i])) else .value end] | join("  ")' <<<"$rows"
 }
 
 # A real run that finished fine clears the last error (without notifying: it only logs it).
@@ -1805,7 +1924,7 @@ cmd_doctor() {
 # A one-letter typo (rub, stauts) or a prefix (inst) suggests the real command.
 suggest_command() {
   local typed="$1" c i diff
-  for c in run install uninstall status detect doctor config log test-notify version help; do
+  for c in run list install uninstall status detect doctor config log test-notify version help; do
     if [[ "$c" == "$typed"* ]] && [ ${#typed} -ge 2 ]; then printf ' (did you mean %s?)' "$c"; return 0; fi
     [ ${#c} -eq ${#typed} ] || continue
     diff=0
@@ -1825,6 +1944,7 @@ main() {
   [ $# -gt 0 ] && shift
   case "$cmd" in
     run) cmd_run "$@" ;;
+    list|ls) cmd_list "$@" ;;
     install) cmd_install "$@" ;;
     uninstall) cmd_uninstall ;;
     status) cmd_status "$@" ;;
