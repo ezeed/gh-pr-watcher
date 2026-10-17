@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake launchctl: logs each call to $LAUNCHCTL_CALLS; nothing is ever loaded.
+printf '%s\n' "$*" >>"$LAUNCHCTL_CALLS"
+case "${1:-}" in
+  list) printf 'PID\tStatus\tLabel\n' ;;
+  print) exit 113 ;;
+esac

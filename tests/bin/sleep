@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake sleep: the mergeable retries would otherwise wait 30 s per PR.
+exit 0
