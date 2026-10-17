@@ -23,7 +23,8 @@
 
 It does what GitHub's **"Update branch"** button does, but for you and on all your PRs at once.
 Nothing changes in the repo: no Actions, no bots, no new permissions. It never resolves conflicts,
-rebases or forces anything: when a PR conflicts, it only notifies you.
+rebases or forces anything: when a PR conflicts, it only notifies you. It also tells you, once,
+when a review requests changes.
 
 Built for repos with the *"Require branches to be up to date before merging"* rule: every merge to
 the base leaves all open PRs behind, and each one has to be updated before it can merge.
@@ -92,6 +93,7 @@ reschedule.
 | `INCLUDE_DRAFTS` | `false` | `true` = drafts get updated too. |
 | `SKIP_LABEL` | *(empty)* | PRs with this label are left alone. The installer offers `no-autoupdate`; in the file you can use any label. |
 | `NOTIFY_IMAGE` | *(the logo)* | Local image (PNG or JPG) shown on the right of the notification. Only with `terminal-notifier`. The icon on the left can't be changed: macOS takes it from the notifying app. |
+| `NOTIFY_CHANGES_REQUESTED` | `true` | `true` = one notification when a review moves a PR to *changes requested*. It isn't repeated while the PR stays that way; if it's approved and changes get requested again, you're notified again. |
 
 A misspelled key (`OWNER=`) or a line that isn't `KEY=VALUE` isn't silently ignored: you get a
 warning, with a suggestion if it looks like a real key. `install` also checks that every owner and
@@ -100,7 +102,8 @@ repo exists and that your account can see it.
 The log and state live in `~/.local/state/gh-pr-watcher/`. While a PR stays conflicting, you
 get reminded at most once an hour (right away if a new one shows up or the list changes): a single notification for all of them, which opens the PR if there is one or a
 local page listing them if there are several. The state only remembers since when each conflict
-has been open: deleting it is harmless. Each log keeps its last 2000 lines (from days to a month, depending on the frequency
+has been open: deleting it is harmless. Reviews that request changes follow the same scheme (one
+notification, or a page if several arrive in the same run), but only once per PR. Each log keeps its last 2000 lines (from days to a month, depending on the frequency
 and how many PRs are open); older ones are dropped on each run.
 
 ## Commands
@@ -135,6 +138,7 @@ existing config and anything missing comes from the defaults.
 | `--drafts` · `--no-drafts` | Update drafts or not (`INCLUDE_DRAFTS`). |
 | `--skip-label L` · `--no-skip-label` | Exclude PRs with label L or not (`SKIP_LABEL`). |
 | `--notify-image PATH` | Notification image (`NOTIFY_IMAGE`). `""` = the logo. |
+| `--notify-changes-requested` · `--no-notify-changes-requested` | Notify when a review requests changes or not (`NOTIFY_CHANGES_REQUESTED`). |
 | `--yes` | Don't ask: use the existing config and the defaults. Useful to reschedule after editing the file. |
 | `--dry-run` | Shows the config and the LaunchAgent it would write, without touching anything. On its own, it still asks the questions. |
 

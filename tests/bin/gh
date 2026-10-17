@@ -26,6 +26,7 @@ done
 set -- ${args[@]+"${args[@]}"}
 
 case "${1:-} ${2:-}" in
+  "--version ") echo "gh version 2.99.0 (fake)"; exit 0 ;;
   "auth status")
     case " $* " in *" --help "*) echo "  --json fields   Output JSON with the specified fields"; exit 0 ;; esac
     key=auth_status ;;

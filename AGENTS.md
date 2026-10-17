@@ -18,6 +18,7 @@ repos and, for each one:
 | Mergeable and up to date | Nothing. |
 | Conflicting | Notification while it stays conflicting, grouped with the other conflicting PRs: at most once an hour, and right away when a new one shows up or the list changes. |
 | GitHub still computing mergeability | Retries for a few seconds; otherwise it waits for the next run. |
+| A review moves it to changes requested | One notification, once (unless `NOTIFY_CHANGES_REQUESTED=false`). Independent of the rows above. |
 
 - **It does not resolve conflicts.** If GitHub's three-way merge applies cleanly, it updates the
   branch; if a single line clashes, it only notifies. When the PR becomes mergeable again there is
@@ -34,7 +35,7 @@ repos and, for each one:
   day (`EVERY_MINUTES`): a shorter interval batches fewer merges into one update.
 - `gh` reads its token from the keychain, which works under launchd.
 
-There are only two notifications, and they are not configurable:
+There are three notifications; only the one for reviews can be turned off:
 
 - **Conflict:** one notification for all conflicting PRs, replacing the previous one, repeated at most
   once an hour unless a new one shows up or the list changes.
@@ -42,6 +43,12 @@ There are only two notifications, and they are not configurable:
   clicking it opens the PR. With several, `N PRs with conflicts (M new)` listing them, and clicking
   it opens `~/.local/state/gh-pr-watcher/conflicts.html`, a page with a link to each one. When no
   conflict is left, the notification is removed.
+- **Changes requested** (`NOTIFY_CHANGES_REQUESTED`, on by default): when a review moves a PR to
+  changes requested, `<repo>#<n> · changes requested` with the title and who asked, opening the PR.
+  Several in the same run: `N PRs with changes requested`, opening
+  `~/.local/state/gh-pr-watcher/changes_requested.html`. Once per PR: it comes back only if the PR
+  leaves that state (approved, review dismissed) and changes are requested again. With the option
+  off, it still keeps track, so turning it on doesn't notify the old ones.
 - **Stopped working:** `stopped working · gh pr-watcher doctor`, with the error as the body (expired
   `gh` session, invalid config, an owner that doesn't exist). Clicking it opens the log. It isn't
   repeated while the error stays the same. A known transient failure (no network, a timeout,
@@ -80,7 +87,8 @@ It returns JSON like this:
   "repos_with_prs": ["AcmeCorp/api", "AcmeCorp/web", "ana/dotfiles"],
   "config": {"path": "...", "exists": false,
              "values": {"GH_USER": "", "OWNERS": "", "REPOS": "", "EVERY_MINUTES": 60,
-                        "INCLUDE_DRAFTS": false, "SKIP_LABEL": ""}},
+                        "INCLUDE_DRAFTS": false, "SKIP_LABEL": "",
+                        "NOTIFY_CHANGES_REQUESTED": true}},
   "installed": {"plist_exists": false, "agent_loaded": false, ...},
   "last_run_error": null,
   "other_watcher_agents": [],
@@ -108,7 +116,7 @@ Decide on your own, without asking, whatever `detect` settles:
 | A single account in `accounts` | Don't pass `--user`. |
 | No orgs in `orgs` | Don't pass `--owners`: it watches all the account's PRs. |
 | `repos_with_prs` falls entirely within one org | `--owners <org>`. |
-| The person didn't mention frequency, drafts or label | The defaults: every 6 h, no drafts, no label. |
+| The person didn't mention frequency, drafts, label or notifications | The defaults: every hour, no drafts, no label, changes-requested notification on. |
 
 Ask the person, in a single question with the options from `detect` in view:
 
@@ -119,7 +127,8 @@ Ask the person, in a single question with the options from `detect` in view:
   it without their OK.
 - **Whether the CI cost is fine**, when it will watch shared repos (see "What it does").
 
-Don't ask about notifications: the conflict notification is always on and not configurable.
+Don't ask about notifications: the conflict one is always on, and the changes-requested one stays on
+unless the person says they don't want it (`--no-notify-changes-requested`).
 
 ## 4. Install
 
@@ -139,6 +148,7 @@ gh pr-watcher install           --owners "AcmeCorp" --every 1h --no-drafts --no-
 | `--drafts` / `--no-drafts` | `INCLUDE_DRAFTS` | |
 | `--skip-label L` / `--no-skip-label` | `SKIP_LABEL` | The convention is `no-autoupdate`. |
 | `--notify-image PATH` | `NOTIFY_IMAGE` | Image attached to notifications. `""` = the bundled one. |
+| `--notify-changes-requested` / `--no-notify-changes-requested` | `NOTIFY_CHANGES_REQUESTED` | Default on. |
 
 `install` validates before writing anything: the format of each value, that the `gh` session is
 valid and has the `repo` scope, and that every owner and repo exists. If something fails, nothing
@@ -175,7 +185,7 @@ gh pr-watcher doctor --json
 ]}
 ```
 
-Check ids: `gh`, `jq`, `config`, `session`, `targets`, `agent`, `last_run`. `status` is `ok`,
+Check ids: `gh`, `jq`, `config`, `notifications`, `session`, `targets`, `agent`, `last_run`. `status` is `ok`,
 `warn` (works, with a caveat) or `fail`. The fix is in `fix`, or inside `message` when the message
 already carries the command. `doctor` changes nothing and doesn't notify: you can run it without
 asking. Applying a `fix` does change things: ask for permission as with `install`.
