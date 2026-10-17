@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# jq filters are single-quoted on purpose: their $vars are jq's, passed with --arg.
+# shellcheck disable=SC2016
 # Runs gh-pr-watcher against the fakes in tests/bin (gh, terminal-notifier, osascript, launchctl,
 # sleep), placed first in PATH: no network, no auth, nothing touched outside a temp sandbox.
 #
@@ -56,28 +58,57 @@ pr_view() {
     mergeable: $m, headRefOid: "head-\($n)", headRefName: "feat-\($n)",
     headRepositoryOwner: {login: "ana"}, baseRefName: "main",
     url: "https://github.com/\($r)/pull/\($n)", title: "PR \($n)",
-    reviewDecision: "", latestReviews: []}')"
+    reviewDecision: "", latestReviews: [], statusCheckRollup: []}')"
+}
+
+# patch_view o/r#N CALL|"" JQ [jq args...]: edits what gh pr view returns, on every call or only
+# on that call number (starting from the every-call answer). Goes after pr or pr_view.
+patch_view() {
+  local repo="${1%#*}" num="${1#*#}" call="$2" filter="$3" base f
+  shift 3
+  base="$FIXTURES/$(fixture_key "pr_view_${repo}_$num")"
+  f="$base.json"
+  if [ -n "$call" ]; then
+    f="$base.$call.json"
+    [ -f "$f" ] || cp "$base.json" "$f"
+  fi
+  jq "$@" "$filter" "$f" >"$f.tmp" && mv "$f.tmp" "$f"
 }
 
 # review o/r#N DECISION [REVIEWER] [call]: the PR's reviewDecision, with REVIEWER's latest review
-# in that state, on every call or only on that call number. Goes after pr or pr_view.
+# in that state.
 review() {
-  local repo="${1%#*}" num="${1#*#}" base f
-  base="$FIXTURES/$(fixture_key "pr_view_${repo}_$num")"
-  f="$base.json"
-  if [ -n "${4:-}" ]; then
-    f="$base.$4.json"
-    [ -f "$f" ] || cp "$base.json" "$f"
-  fi
-  jq --arg d "$2" --arg by "${3:-}" '.reviewDecision = $d
-    | .latestReviews = (if $by == "" then [] else [{author: {login: $by}, state: $d}] end)' "$f" >"$f.tmp"
-  mv "$f.tmp" "$f"
+  patch_view "$1" "${4:-}" '.reviewDecision = $d
+    | .latestReviews = (if $by == "" then [] else [{author: {login: $by}, state: $d}] end)' \
+    --arg d "$2" --arg by "${3:-}"
 }
 
-# behind o/r#N COMMITS: how far the head is behind main.
+# head_at o/r#N SHA CALL: the head the PR has on that call.
+head_at() { patch_view "$1" "$3" '.headRefOid = $s' --arg s "$2"; }
+
+# checks o/r#N CALL "name:CONCLUSION"...: the head's checks on that call; IN_PROGRESS = still running.
+checks() {
+  local pr="$1" call="$2" rollup
+  shift 2
+  rollup=$(printf '%s\n' "$@" | jq -R 'split(":") | {__typename: "CheckRun", name: .[0], workflowName: "ci",
+    status: (if .[1] == "IN_PROGRESS" then "IN_PROGRESS" else "COMPLETED" end),
+    conclusion: (if .[1] == "IN_PROGRESS" then "" else .[1] end)}' | jq -s .)
+  patch_view "$pr" "$call" '.statusCheckRollup = $r' --argjson r "$rollup"
+}
+
+# commit o/r SHA PARENT...: the commit, as gh api repos/o/r/commits/SHA returns it.
+commit() {
+  local repo="$1" sha="$2"
+  shift 2
+  fixture "api_GET_repos/$repo/commits/$sha" "$(printf '%s\n' "$@" | jq -R '{sha: .}' | jq -s --arg s "$sha" '{sha: $s, parents: .}')"
+}
+
+# behind o/r#N COMMITS [call]: how far the head is behind main, on every call or only on that one.
 behind() {
-  local repo="${1%#*}" num="${1#*#}"
-  fixture "api_GET_repos/$repo/compare/main...ana:feat-$num" "{\"behind_by\": $2, \"ahead_by\": 1}"
+  local repo="${1%#*}" num="${1#*#}" key
+  key="api_GET_repos/$repo/compare/main...ana:feat-$num"
+  [ -n "${3:-}" ] && key="$key.$3"
+  fixture "$key" "{\"behind_by\": $2, \"ahead_by\": 1}"
 }
 
 # pr o/r#N MERGEABLE|CONFLICTING|UNKNOWN COMMITS_BEHIND: a PR GitHub accepts updating.
@@ -381,7 +412,128 @@ test_notify_changes_requested_config_and_flags() {
 
   config NOTIFY_CHANGES_REQUESTED=false
   watcher doctor --json
-  assert_json "$SANDBOX/out" '.checks[] | select(.id == "notifications") | .message | test("conflicts only")'
+  assert_json "$SANDBOX/out" '.checks[] | select(.id == "notifications") | .message == "notifies: conflicts"'
+}
+
+# ── run: CI failing after an update ────────────────────────────────────────────────────────────
+
+# A PR behind on the first run, updated by the watcher into merge-N (parents head-N and main).
+updated_pr() {
+  local repo="${1%#*}" num="${1#*#}"
+  pr "$1" MERGEABLE 0
+  behind "$1" 3 1
+  head_at "$1" "merge-$num" 2
+  commit "$repo" "merge-$num" "head-$num" main-sha
+  patch_view "$1" "" '.headRefOid = $s' --arg s "merge-$num"
+  patch_view "$1" 1 '.headRefOid = "head-\(.title | ltrimstr("PR "))"'
+}
+
+test_ci_failure_on_the_watchers_update_notifies_once() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  checks 'acme/api#7' 2 'lint:SUCCESS' 'test:FAILURE'
+  checks 'acme/api#7' '' 'lint:SUCCESS' 'test:FAILURE'
+  watcher run
+  assert_json "$STATE_DIR/updates.json" '.["acme/api#7"].from == "head-7"'
+  assert_notified 0
+  watcher run
+  assert_rc 0
+  assert_log 'acme/api#7: CI failed on the watcher.s update \(test\)'
+  assert_has "$NOTIFY_CALLS" '-subtitle api#7 · CI failed after the update -message PR 7 · failed: test -open https://github.com/acme/api/pull/7/checks .*-group gh-pr-watcher-ci' 1
+  assert_json "$STATE_DIR/updates.json" '.["acme/api#7"].sha == "merge-7"'
+
+  watcher run
+  assert_notified 1
+  assert_log 'CI still failing on the watcher.s update'
+  watcher status --json
+  assert_json "$SANDBOX/out" '.ci_failed == [{key: "acme/api#7", sha: "merge-7", failed: "test"}]'
+}
+
+test_ci_passing_on_the_watchers_update_is_quiet() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  checks 'acme/api#7' 2 'lint:SUCCESS' 'test:IN_PROGRESS'
+  checks 'acme/api#7' 3 'lint:SUCCESS' 'test:SUCCESS'
+  watcher run
+  watcher run
+  assert_json "$STATE_DIR/updates.json" '.["acme/api#7"].sha == "merge-7"'
+  watcher run
+  assert_rc 0
+  assert_log 'acme/api#7: CI passed on the watcher.s update'
+  assert_json "$STATE_DIR/updates.json" '. == {}'
+  assert_notified 0
+}
+
+test_ci_failure_after_your_own_push_is_not_notified() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  # You pushed before GitHub merged: the new head is your commit, on top of the old one.
+  head_at 'acme/api#7' mine-7 2
+  patch_view 'acme/api#7' "" '.headRefOid = "mine-7"'
+  commit acme/api mine-7 head-7
+  checks 'acme/api#7' '' 'test:FAILURE'
+  watcher run
+  watcher run
+  assert_log 'acme/api#7: the head moved by a push of yours'
+  watcher run
+  assert_notified 0
+  assert_json "$STATE_DIR/updates.json" '. == {}'
+}
+
+test_ci_failure_after_a_push_on_top_is_not_notified() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  checks 'acme/api#7' 2 'test:IN_PROGRESS'
+  head_at 'acme/api#7' mine-7 3
+  checks 'acme/api#7' 3 'test:FAILURE'
+  watcher run
+  watcher run
+  watcher run
+  assert_notified 0
+  assert_json "$STATE_DIR/updates.json" '. == {}'
+}
+
+test_ci_failures_on_several_updates_share_a_page() {
+  config NOTIFY_CI_FAILED=true
+  search_prs 'acme/api#7' 'acme/web#9'
+  updated_pr 'acme/api#7'
+  updated_pr 'acme/web#9'
+  checks 'acme/api#7' 2 'test:FAILURE'
+  checks 'acme/web#9' 2 'build:TIMED_OUT'
+  watcher run
+  watcher run
+  assert_has "$NOTIFY_CALLS" "-subtitle 2 PRs with CI failing after the update -message api#7, web#9 -open file://$STATE_DIR/ci_failed.html" 1
+  assert_has "$STATE_DIR/ci_failed.html" 'failed: build · after merging main into it'
+}
+
+test_ci_failures_are_not_followed_by_default() {
+  search_prs 'acme/api#7'
+  updated_pr 'acme/api#7'
+  checks 'acme/api#7' '' 'test:FAILURE'
+  watcher run
+  watcher run
+  assert_rc 0
+  assert_lacks "$GH_CALLS" '/commits/'
+  assert_notified 0
+  assert_json "$STATE_DIR/updates.json" '. == {}'
+}
+
+test_notify_ci_failed_config_and_flags() {
+  watcher install --dry-run --notify-ci-failed
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^NOTIFY_CI_FAILED=true$' 1
+  config NOTIFY_CI_FAILED=yes
+  watcher run
+  assert_rc 1
+  assert_log 'NOTIFY_CI_FAILED must be true or false'
+  config NOTIFY_CI_FAILED=true
+  watcher doctor --json
+  assert_json "$SANDBOX/out" '.checks[] | select(.id == "notifications") | .message
+    == "notifies: conflicts, reviews that request changes, CI failing after an update"'
 }
 
 # ── run --dry-run ──────────────────────────────────────────────────────────────────────────────
