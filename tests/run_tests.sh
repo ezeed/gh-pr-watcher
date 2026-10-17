@@ -57,7 +57,7 @@ pr_view() {
   fixture "$key" "$(jq -n --arg r "$repo" --argjson n "$num" --arg m "$2" '{
     mergeable: $m, headRefOid: "head-\($n)", headRefName: "feat-\($n)",
     headRepositoryOwner: {login: "ana"}, baseRefName: "main",
-    url: "https://github.com/\($r)/pull/\($n)", title: "PR \($n)",
+    url: "https://github.com/\($r)/pull/\($n)", title: "PR \($n)", createdAt: (now - 7200 | todate),
     reviewDecision: "", latestReviews: [], statusCheckRollup: []}')"
 }
 
@@ -552,9 +552,81 @@ test_dry_run_changes_nothing() {
   assert_log '\(dry-run\) would notify: api#7 · changes requested'
   local f
   for f in state.json conflicts.json conflicts.html conflicts_reminded.json changes_requested.json \
-    changes_requested.html last_run last_error; do
+    changes_requested.html updates.json ci_failed.html last_actions.json last_run last_error; do
     assert_no_file "$STATE_DIR/$f"
   done
+}
+
+# ── list ───────────────────────────────────────────────────────────────────────────────────────
+
+test_list_puts_what_needs_you_first() {
+  search_prs 'acme/api#1' 'acme/api#2' 'acme/api#3' 'acme/api#4' 'acme/api#5'
+  pr 'acme/api#1' MERGEABLE 0
+  pr 'acme/api#2' MERGEABLE 3
+  pr 'acme/api#3' CONFLICTING 5
+  pr 'acme/api#4' MERGEABLE 0
+  review 'acme/api#4' CHANGES_REQUESTED bob
+  pr 'acme/api#5' MERGEABLE 0
+  checks 'acme/api#5' '' 'lint:SUCCESS' 'test:FAILURE'
+  checks 'acme/api#1' '' 'lint:SUCCESS'
+  review 'acme/api#1' APPROVED
+  watcher list
+  assert_rc 0
+  [ "$(awk 'NR > 1 {printf "%s ", $2}' "$SANDBOX/out")" = "#3 #4 #5 #2 #1 " ] \
+    || fail "rows out of order: $(awk 'NR > 1 {printf "%s ", $2}' "$SANDBOX/out")"
+  assert_has "$SANDBOX/out" '^REPO +PR +STATE +CI +REVIEWS +LAST RUN +AGE +TITLE$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#3 +conflict +- +- +- +2h +PR 3$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#4 +up to date +- +changes requested +- +2h +PR 4$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#5 +up to date +failing +' 1
+  assert_has "$SANDBOX/out" '^acme/api +#2 +3 behind +' 1
+  assert_has "$SANDBOX/out" '^acme/api +#1 +up to date +passing +approved +' 1
+  # It only reads.
+  assert_lacks "$GH_CALLS" 'update-branch'
+  assert_notified 0
+  assert_no_file "$STATE_DIR/state.json"
+  assert_no_file "$STATE_DIR/last_run"
+  assert_no_file "$STATE_DIR/watcher.log"
+}
+
+test_list_shows_what_the_last_run_did() {
+  search_prs 'acme/api#7' 'acme/api#8' 'acme/api#9 draft'
+  pr 'acme/api#7' MERGEABLE 3
+  pr 'acme/api#8' CONFLICTING 1
+  watcher run
+  watcher list
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^acme/api +#7 +3 behind +- +- +3 behind → branch updated from main \(CI will run\) +2h +PR 7$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#8 +conflict +- +- +CONFLICT \(1 behind\) ' 1
+  assert_json "$STATE_DIR/last_actions.json" '.prs["acme/api#9"] == "draft, left alone"'
+}
+
+test_list_json_has_one_object_per_pr() {
+  search_prs 'acme/api#7' 'acme/web#9'
+  pr 'acme/api#7' MERGEABLE 2
+  checks 'acme/api#7' '' 'test:IN_PROGRESS'
+  pr_view 'acme/web#9' UNKNOWN
+  watcher list --json
+  assert_rc 0
+  assert_json "$SANDBOX/out" 'length == 2 and (map(.number) == [7, 9])'
+  assert_json "$SANDBOX/out" '.[0] | .repo == "acme/api" and .state == "behind" and .behind == 2 and .ci == "pending"
+    and .review == null and .last_run == null and .url == "https://github.com/acme/api/pull/7" and .title == "PR 7"'
+  assert_json "$SANDBOX/out" '.[1] | .state == "unknown" and .mergeable == "UNKNOWN"'
+}
+
+test_list_uses_the_same_filters_as_run() {
+  config 'REPOS=acme/api' SKIP_LABEL=no-autoupdate
+  search_prs 'acme/api#7' 'acme/api#8 draft' 'acme/api#9 label:no-autoupdate'
+  pr 'acme/api#7' MERGEABLE 0
+  watcher list --json
+  assert_rc 0
+  assert_has "$GH_CALLS" '^search prs .* --repo acme/api$' 1
+  assert_json "$SANDBOX/out" 'map(.number) == [7]'
+  search_prs
+  watcher list
+  assert_has "$SANDBOX/out" '^no open PRs$' 1
+  watcher list --wide
+  assert_rc 1
+  assert_has "$SANDBOX/out" 'error: unknown option for list: --wide' 1
 }
 
 # ── run: errors ────────────────────────────────────────────────────────────────────────────────
@@ -593,7 +665,9 @@ for t in $(declare -F | awk '{print $3}' | grep '^test_'); do
   [ -z "${1:-}" ] || [[ "$t" == *$1* ]] || continue
   if (
     setup
-    out=$("$t")
+    # A test that aborts (an unset variable, a failing helper) fails too, with what it said.
+    out=$("$t" 2>&1) || out="${out:+$out
+}    ✗ the test aborted (exit $?)"
     if [ -z "$out" ]; then rm -rf "$SANDBOX"; exit 0; fi
     printf '✗ %s\n%s\n    sandbox: %s\n' "${t#test_}" "$out" "$SANDBOX"
     exit 1

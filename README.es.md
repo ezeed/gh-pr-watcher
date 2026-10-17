@@ -114,6 +114,7 @@ cuántos PRs haya abiertos); las anteriores se descartan en cada vuelta.
 |---|---|
 | `install [opciones]` | Guarda la config y programa la corrida (launchd en macOS; en Linux imprime la línea de `crontab`). Sin opciones y con terminal, pregunta. |
 | `run [--dry-run]` | Corre una vuelta ahora. Con `--dry-run` informa qué haría, sin actualizar ramas, sin notificar y sin guardar estado. |
+| `list [--json]` | Tus PRs abiertos como los ve una vuelta (mismos filtros), primero los que te necesitan: conflicto, cambios pedidos, CI fallando, atrasados, al día. Muestra estado, CI, reviews, qué hizo la última vuelta, antigüedad y título. No cambia nada. `--json` da un objeto por PR. |
 | `status [--json]` | Config, si el agente está cargado, la última vuelta, el último error y el final del log. |
 | `doctor [--json]` | Revisa todo lo que hace falta para que una vuelta ande y dice cómo arreglar cada problema. No cambia nada. |
 | `log [N]` | Las últimas N líneas del log (30 por default). |
