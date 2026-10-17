@@ -51,7 +51,7 @@ gh pr-watcher install          # te pregunta la config y programa la corrida
 gh pr-watcher run --dry-run    # prueba: informa qué haría, sin actualizar ninguna rama
 ```
 
-Para fijar una versión: `gh extension install ezeed/gh-pr-watcher --pin v0.2.1` (ver [releases](https://github.com/ezeed/gh-pr-watcher/releases)).
+Para fijar una versión: `gh extension install ezeed/gh-pr-watcher --pin v0.3.0` (ver [releases](https://github.com/ezeed/gh-pr-watcher/releases)).
 
 ### Con un agente
 
