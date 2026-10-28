@@ -20,6 +20,7 @@ repos and, for each one:
 | GitHub still computing mergeability | Retries for a few seconds; otherwise it waits for the next run. |
 | A review moves it to changes requested | One notification, once (unless `NOTIFY_CHANGES_REQUESTED=false`). Independent of the rows above. |
 | CI fails on a branch the watcher updated | One notification, once (only with `NOTIFY_CI_FAILED=true`). Not for the person's own pushes. |
+| Someone else's open PR, by a login in `AUTO_APPROVE_AUTHORS` | Approved as `GH_USER` (only when `AUTO_APPROVE_AUTHORS` is set, up to `AUTO_APPROVE_UNTIL`). Not drafts, not PRs with `SKIP_LABEL`, never the person's own; not when that account's latest approval is still live; with `AUTO_APPROVE_REQUIRE_CI=true` (the default), only when the head has checks and all of them passed. |
 
 - **It does not resolve conflicts.** If GitHub's three-way merge applies cleanly, it updates the
   branch; if a single line clashes, it only notifies. When the PR becomes mergeable again there is
@@ -35,6 +36,12 @@ repos and, for each one:
   can mean one extra CI run per ready PR per person using it. The cap is the number of runs per
   day (`EVERY_MINUTES`): a shorter interval batches fewer merges into one update.
 - `gh` reads its token from the keychain, which works under launchd.
+- **Auto-approval approves code on the person's behalf.** It searches the PRs of each login in
+  `AUTO_APPROVE_AUTHORS` in the same orgs or repos (with neither, everywhere those people have open
+  PRs) and approves them as `GH_USER`. A push that dismisses the approval, or a review of the
+  person's that requests changes, makes the PR eligible again. That's why CI is required by default
+  and an end date is recommended: `--auto-approve` without one sets a week. Past the end date it
+  approves nothing and logs `auto-approve expired on <date>` once.
 
 There are four notifications; the conflict and stopped-working ones can't be turned off:
 
@@ -95,7 +102,9 @@ It returns JSON like this:
   "config": {"path": "...", "exists": false,
              "values": {"GH_USER": "", "OWNERS": "", "REPOS": "", "EVERY_MINUTES": 60,
                         "INCLUDE_DRAFTS": false, "SKIP_LABEL": "",
-                        "NOTIFY_CHANGES_REQUESTED": true, "NOTIFY_CI_FAILED": false}},
+                        "NOTIFY_CHANGES_REQUESTED": true, "NOTIFY_CI_FAILED": false,
+                        "AUTO_APPROVE_AUTHORS": "", "AUTO_APPROVE_UNTIL": "",
+                        "AUTO_APPROVE_REQUIRE_CI": true}},
   "installed": {"plist_exists": false, "agent_loaded": false, ...},
   "last_run_error": null,
   "other_watcher_agents": [],
@@ -123,7 +132,7 @@ Decide on your own, without asking, whatever `detect` settles:
 | A single account in `accounts` | Don't pass `--user`. |
 | No orgs in `orgs` | Don't pass `--owners`: it watches all the account's PRs. |
 | `repos_with_prs` falls entirely within one org | `--owners <org>`. |
-| The person didn't mention frequency, drafts, label or notifications | The defaults: every hour, no drafts, no label, changes-requested notification on, CI-failed off. |
+| The person didn't mention frequency, drafts, label, notifications or approvals | The defaults: every hour, no drafts, no label, changes-requested notification on, CI-failed off, auto-approval off. |
 
 Ask the person, in a single question with the options from `detect` in view:
 
@@ -133,6 +142,9 @@ Ask the person, in a single question with the options from `detect` in view:
 - **Whether it replaces a previous watcher**, when `other_watcher_agents` isn't empty. Never unload
   it without their OK.
 - **Whether the CI cost is fine**, when it will watch shared repos (see "What it does").
+
+Don't turn on auto-approval unless the person asks for it. When they do, confirm the logins and
+how long (`--auto-approve-for 1w` if they don't say), and say that it approves code as their account.
 
 Don't ask about notifications: the conflict one is always on, and the changes-requested one stays on
 unless the person says they don't want it (`--no-notify-changes-requested`). The CI-failed one stays
@@ -158,11 +170,15 @@ gh pr-watcher install           --owners "AcmeCorp" --every 1h --no-drafts --no-
 | `--notify-image PATH` | `NOTIFY_IMAGE` | Image attached to notifications. `""` = the bundled one. |
 | `--notify-changes-requested` / `--no-notify-changes-requested` | `NOTIFY_CHANGES_REQUESTED` | Default on. |
 | `--notify-ci-failed` / `--no-notify-ci-failed` | `NOTIFY_CI_FAILED` | Default off. |
+| `--auto-approve "a b"` / `--no-auto-approve` | `AUTO_APPROVE_AUTHORS` | GitHub logins, space-separated. Empty = off (the default). |
+| `--auto-approve-for 1w\|<N>d\|forever` | `AUTO_APPROVE_UNTIL` | Last day it approves: today + the duration (`1w` = today + 7), or no end date with `forever`. `--auto-approve` with no end date anywhere sets `1w`. |
+| `--auto-approve-until YYYY-MM-DD` | `AUTO_APPROVE_UNTIL` | The same, as a date. |
+| `--auto-approve-require-ci` / `--no-auto-approve-require-ci` | `AUTO_APPROVE_REQUIRE_CI` | Default on: approve only when every check passed. |
 
 `install` validates before writing anything: the format of each value, that the `gh` session is
-valid and has the `repo` scope, and that every owner and repo exists. If something fails, nothing
-is left half-done. Flags you don't pass keep the value from the existing config. `--yes` forces the
-no-questions mode even with a terminal.
+valid and has the `repo` scope, and that every owner, repo and auto-approved login exists. If
+something fails, nothing is left half-done. Flags you don't pass keep the value from the existing
+config. `--yes` forces the no-questions mode even with a terminal.
 
 Installing loads a LaunchAgent in the person's session: ask for their OK before running `install`
 without `--dry-run`.
@@ -197,7 +213,7 @@ gh pr-watcher doctor --json
 ]}
 ```
 
-Check ids: `gh`, `jq`, `config`, `notifications`, `session`, `targets`, `agent`, `last_run`. `status` is `ok`,
+Check ids: `gh`, `jq`, `config`, `notifications`, `auto_approve`, `session`, `targets`, `agent`, `last_run`. `status` is `ok`,
 `warn` (works, with a caveat) or `fail`. The fix is in `fix`, or inside `message` when the message
 already carries the command. `doctor` changes nothing and doesn't notify: you can run it without
 asking. Applying a `fix` does change things: ask for permission as with `install`.
@@ -213,6 +229,9 @@ common ones:
 | `no connection to GitHub, try again later` / `GitHub is failing, try again later` / `GitHub rate limit hit, try again later` | Transient: retry in a few minutes; it isn't a config problem. If it persists without network, check the proxy. |
 | `user or org 'X' does not exist on GitHub` / `repo 'X' does not exist or your account has no access to it` | Fix `--owners`/`--repos` with the values from `detect`. |
 | `… must be separated by spaces, not commas` / `REPOS has an invalid repo` | Owners and repos are space-separated; repos are `owner/repo`. |
+| `user 'X' in AUTO_APPROVE_AUTHORS does not exist on GitHub` | Fix the login in `--auto-approve`. |
+| `AUTO_APPROVE_UNTIL must be a date as YYYY-MM-DD` / `--auto-approve-for must be 1w, <N>d or forever` | `--auto-approve-for 1w`, `--auto-approve-until 2026-12-31` or `forever`. |
+| `auto-approve ended on <date>` (doctor, `warn`) | It approves nothing anymore. If the person wants more: `install --auto-approve-for 1w`. |
 | `EVERY_MINUTES must be one of 15 30 60 120 180` / `--every must be …` | `--every 15m`, `30m`, `1h`, `2h` or `3h`. |
 | `EVERY_HOURS=N is no longer offered` | An old config with more than 3 h: pass `--every` with one of the offered values. |
 | `NOTIFY_IMAGE is not a readable file` | An existing local path, or `--notify-image ""`. |

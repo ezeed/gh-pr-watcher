@@ -19,6 +19,7 @@ CHANGES_PAGE="$STATE_DIR/changes_requested.html"
 UPDATES="$STATE_DIR/updates.json"
 LAST_ACTIONS="$STATE_DIR/last_actions.json"
 CI_PAGE="$STATE_DIR/ci_failed.html"
+APPROVE_EXPIRED="$STATE_DIR/auto_approve_expired"
 LOG="$STATE_DIR/watcher.log"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LAST_ERROR="$STATE_DIR/last_error"
@@ -28,7 +29,7 @@ LOG_MAX_LINES=2000
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_IMAGE="$SELF_DIR/assets/icon.png"
 
-CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_MINUTES INCLUDE_DRAFTS SKIP_LABEL NOTIFY_IMAGE NOTIFY_CHANGES_REQUESTED NOTIFY_CI_FAILED"
+CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_MINUTES INCLUDE_DRAFTS SKIP_LABEL NOTIFY_IMAGE NOTIFY_CHANGES_REQUESTED NOTIFY_CI_FAILED AUTO_APPROVE_AUTHORS AUTO_APPROVE_UNTIL AUTO_APPROVE_REQUIRE_CI"
 # Read from older configs and converted to EVERY_MINUTES; never written.
 LEGACY_KEYS="EVERY_HOURS"
 EVERY_OPTIONS="15 30 60 120 180"
@@ -49,12 +50,17 @@ SKIP_LABEL=""
 NOTIFY_IMAGE=""
 NOTIFY_CHANGES_REQUESTED="true"
 NOTIFY_CI_FAILED="false"
+AUTO_APPROVE_AUTHORS=""
+AUTO_APPROVE_UNTIL=""
+AUTO_APPROVE_REQUIRE_CI="true"
 
 # IN_RUN=1 inside a real run: fatal errors go to the log and get notified,
 # because under launchd nobody reads stderr.
 IN_RUN=0
 HAVE_LOCK=0
 GH_ERR_FILE=""
+# Login require_session resolved: GH_USER or the active account.
+SESSION_LOGIN=""
 
 usage() {
   cat <<EOF
@@ -79,6 +85,13 @@ Commands:
                             Notify when a review requests changes (on by default).
     --notify-ci-failed | --no-notify-ci-failed
                             Notify when CI fails on a branch the watcher updated (off by default).
+    --auto-approve "A B" | --no-auto-approve
+                            Approve, as your account, the open PRs by these logins in the
+                            watched repos (off by default).
+    --auto-approve-for 1w|<N>d|forever | --auto-approve-until YYYY-MM-DD
+                            Last day it approves (1w by default with --auto-approve).
+    --auto-approve-require-ci | --no-auto-approve-require-ci
+                            Approve only when every check passed (on by default).
     --yes                   Don't ask: existing config + flags + defaults.
     --dry-run               Show what it would write, without touching anything.
   detect [--user LOGIN]   JSON with what's needed to decide the install: accounts,
@@ -223,6 +236,7 @@ require_session() {
   [ -n "$login" ] || die "gh has no session on github.com; run gh auth login"
   entry=$(jq -c --arg l "$login" '.hosts["github.com"][]? | select(.login == $l)' <<<"$hosts")
   [ -n "$entry" ] || die "gh has no session as '$login'; run gh auth login"
+  SESSION_LOGIN="$login"
   state=$(jq -r '.state // ""' <<<"$entry")
   if [ "$state" != "success" ]; then
     err=$(jq -r '.error // ""' <<<"$entry")
@@ -329,6 +343,16 @@ NOTIFY_CHANGES_REQUESTED=$NOTIFY_CHANGES_REQUESTED
 
 # true = notify once when CI fails on a branch the watcher updated (not on your own pushes).
 NOTIFY_CI_FAILED=$NOTIFY_CI_FAILED
+
+# GitHub logins separated by spaces: their open PRs in the watched repos get approved as your account.
+# Empty = nothing is approved. Your own PRs never are.
+AUTO_APPROVE_AUTHORS=$AUTO_APPROVE_AUTHORS
+
+# Last day (YYYY-MM-DD, inclusive) it approves. Empty = no end date.
+AUTO_APPROVE_UNTIL=$AUTO_APPROVE_UNTIL
+
+# true = approve only when the PR has checks and every one passed (success, neutral or skipped).
+AUTO_APPROVE_REQUIRE_CI=$AUTO_APPROVE_REQUIRE_CI
 EOF
 }
 
@@ -336,8 +360,11 @@ validate_config() {
   valid_config_every || die "EVERY_MINUTES must be one of $EVERY_OPTIONS (got '$EVERY_MINUTES')"
   case "$OWNERS" in *,*) die "OWNERS must be separated by spaces, not commas (got '$OWNERS')" ;; esac
   case "$REPOS" in *,*) die "REPOS must be separated by spaces, not commas (got '$REPOS')" ;; esac
+  case "$AUTO_APPROVE_AUTHORS" in
+    *,*) die "AUTO_APPROVE_AUTHORS must be separated by spaces, not commas (got '$AUTO_APPROVE_AUTHORS')" ;;
+  esac
   local ow
-  for ow in $GH_USER $OWNERS; do
+  for ow in $GH_USER $OWNERS $AUTO_APPROVE_AUTHORS; do
     [[ "$ow" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]] || die "'$ow' is not a valid GitHub user or org"
   done
   [ -z "$GH_USER" ] || [ "$(wc -w <<<"$GH_USER" | tr -d ' ')" = "1" ] || die "GH_USER is a single account (got '$GH_USER')"
@@ -353,7 +380,21 @@ validate_config() {
     *) die "NOTIFY_CHANGES_REQUESTED must be true or false (got '$NOTIFY_CHANGES_REQUESTED')" ;;
   esac
   case "$NOTIFY_CI_FAILED" in true|false) ;; *) die "NOTIFY_CI_FAILED must be true or false (got '$NOTIFY_CI_FAILED')" ;; esac
+  if [ -n "$AUTO_APPROVE_UNTIL" ] && ! valid_date "$AUTO_APPROVE_UNTIL"; then
+    die "AUTO_APPROVE_UNTIL must be a date as YYYY-MM-DD (got '$AUTO_APPROVE_UNTIL')"
+  fi
+  case "$AUTO_APPROVE_REQUIRE_CI" in true|false) ;;
+    *) die "AUTO_APPROVE_REQUIRE_CI must be true or false (got '$AUTO_APPROVE_REQUIRE_CI')" ;;
+  esac
 }
+
+valid_date() { [[ "$1" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]]; }
+
+# Today plus N days as YYYY-MM-DD, by calendar (BSD date, then GNU date).
+date_plus_days() { date -v+"$1"d +%F 2>/dev/null || date -d "+$1 days" +%F; }
+
+# With an end date in the past, auto-approval is over.
+auto_approve_expired() { [ -n "$AUTO_APPROVE_UNTIL" ] && [[ "$(date +%F)" > "$AUTO_APPROVE_UNTIL" ]]; }
 
 # With GH_USER, the whole run uses that account's token even if another one is active.
 use_account() {
@@ -383,6 +424,21 @@ APPLESCRIPT
   fi
   return 0
 }
+
+# jq definitions over a statusCheckRollup array, shared by run, list and auto-approval. approval_ci is
+# "passing" only when there are checks and every one completed as success, neutral or skipped.
+CHECKS_JQ='
+  def failed_checks: [.[] | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"))
+    | .name // .context] | unique;
+  def pending_check: (.__typename == "CheckRun" and .status != "COMPLETED")
+    or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED"));
+  def passed_check: if .__typename == "StatusContext" then .state == "SUCCESS"
+    else .status == "COMPLETED" and ((.conclusion // "") | IN("SUCCESS", "NEUTRAL", "SKIPPED")) end;
+  def unpassed_checks: [.[] | select((passed_check | not) and (pending_check | not)) | .name // .context] | unique;
+  def approval_ci: if length == 0 then "none"
+    elif (unpassed_checks | length) > 0 then "failing: " + (unpassed_checks | join(", "))
+    elif any(.[]; pending_check) then "pending" else "passing" end;
+'
 
 # Keeps the PR's previous state when a run gets no new answer, so a known conflict stays in
 # the reminder instead of dropping out of it. Uses cmd_run's variables.
@@ -488,9 +544,7 @@ follow_update() {
     entry=$(jq -c --arg s "$sha" '.sha = $s' <<<"$entry")
   fi
   [ "$oid" = "$sha" ] || return 0
-  failed=$(jq -r '[.statusCheckRollup[]?
-    | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"))
-    | .name // .context] | unique | join(", ")' <<<"$info")
+  failed=$(jq -r "$CHECKS_JQ"'(.statusCheckRollup // []) | failed_checks | join(", ")' <<<"$info")
   if [ -n "$failed" ]; then
     if jq -e '.failed' <<<"$entry" >/dev/null; then
       did "$key" "CI still failing on the watcher's update ($failed)"
@@ -503,9 +557,7 @@ follow_update() {
     keep_update "$(jq -c --arg f "$failed" '.failed = $f' <<<"$entry")"
     return 0
   fi
-  pending=$(jq '[.statusCheckRollup[]? | select(
-      (.__typename == "CheckRun" and .status != "COMPLETED")
-      or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED")))] | length' <<<"$info")
+  pending=$(jq "$CHECKS_JQ"'[.statusCheckRollup[]? | select(pending_check)] | length' <<<"$info")
   if [ "$pending" = "0" ] && [ "$(jq '.statusCheckRollup | length' <<<"$info")" != "0" ]; then
     did "$key" "CI passed on the watcher's update"
   elif [ $((now - $(jq -r '.at // 0' <<<"$entry"))) -lt "$FOLLOW_UPDATE_SEC" ]; then
@@ -591,10 +643,10 @@ notify_conflicts() { # conflicts_json dry_run
   jq -n --argjson at "$now" --arg keys "$keys" '{at: $at, keys: $keys}' >"$REMINDED"
 }
 
-# The search a run makes, in SEARCH_ARGS (a function can't return an array, and gh_fail must
-# run in the caller's shell to stop it).
-search_args() {
-  SEARCH_ARGS=(search prs --author @me --state open --limit 100
+# The search a run makes, for your PRs or for AUTHOR's, in SEARCH_ARGS (a function can't return an
+# array, and gh_fail must run in the caller's shell to stop it).
+search_args() { # [author]
+  SEARCH_ARGS=(search prs --author "${1:-@me}" --state open --limit 100
     --json "repository,number,isDraft,labels,title,url")
   local o r
   # gh search ANDs --owner and --repo: when repos are chosen, orgs are not passed.
@@ -626,6 +678,84 @@ view_pr() { # repo num
     sleep $((attempt * 5))
   done
   printf '%s' "$info"
+}
+
+APPROVE_FIELDS="headRefOid,author,reviews,statusCheckRollup,title"
+
+lower() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
+
+# Approves, as SESSION_LOGIN, the open PRs by AUTO_APPROVE_AUTHORS in the watched scope that don't
+# carry its live approval yet, and with AUTO_APPROVE_REQUIRE_CI only once every check passed.
+# Past AUTO_APPROVE_UNTIL it approves nothing and logs it once. Uses cmd_run's variables.
+auto_approve() { # dry_run
+  [ -n "$AUTO_APPROVE_AUTHORS" ] || return 0
+  if auto_approve_expired; then
+    if [ "$1" = "1" ]; then
+      log "(dry-run) auto-approve expired on $AUTO_APPROVE_UNTIL, approving nothing"
+    elif [ "$(cat "$APPROVE_EXPIRED" 2>/dev/null)" != "$AUTO_APPROVE_UNTIL" ]; then
+      log "auto-approve expired on $AUTO_APPROVE_UNTIL"
+      printf '%s\n' "$AUTO_APPROVE_UNTIL" >"$APPROVE_EXPIRED"
+    fi
+    return 0
+  fi
+  local me author found found_prs repo num skip key info oid title last ci err reason
+  me=$(lower "$SESSION_LOGIN")
+  for author in $AUTO_APPROVE_AUTHORS; do
+    [ "$(lower "$author")" = "$me" ] && continue
+    search_args "$author"
+    if ! found=$(ghq "${SEARCH_ARGS[@]}"); then
+      err=$(gh_err)
+      if reason=$(transient_reason "$err"); then
+        log "$reason, skipping the PRs by $author this run ($err)"
+        continue
+      fi
+      die "the search for PRs by $author on GitHub failed: ${err:-no details from gh}"
+    fi
+    found_prs=$(jq -r --arg skip "$SKIP_LABEL" '.[] | "\(.repository.nameWithOwner) \(.number) "
+      + (if .isDraft then "draft" elif $skip != "" and ([.labels[].name] | index($skip)) then "label" else "-" end)' <<<"$found")
+    [ -n "$found_prs" ] || continue
+    while read -r repo num skip; do
+      key="$repo#$num"
+      case "$skip" in
+        draft) did "$key" "draft by $author, not approved"; continue ;;
+        label) did "$key" "label $SKIP_LABEL, not approved"; continue ;;
+      esac
+      if ! info=$(ghq pr view "$num" -R "$repo" --json "$APPROVE_FIELDS"); then
+        did "$key" "could not read the PR to approve it, will retry next run"
+        continue
+      fi
+      [ "$(jq -r '.author.login // "" | ascii_downcase' <<<"$info")" = "$me" ] && continue
+      oid=$(jq -r .headRefOid <<<"$info")
+      title=$(jq -r .title <<<"$info")
+      last=$(jq -r --arg me "$me" '[.reviews[]? | select((.author.login // "" | ascii_downcase) == $me
+          and (.state | IN("APPROVED", "DISMISSED", "CHANGES_REQUESTED")))]
+        | sort_by(.submittedAt // "") | last | .state // ""' <<<"$info")
+      if [ "$last" = "APPROVED" ]; then
+        did "$key" "already approved by you"
+        continue
+      fi
+      if [ "$AUTO_APPROVE_REQUIRE_CI" = "true" ]; then
+        ci=$(jq -r "$CHECKS_JQ"'(.statusCheckRollup // []) | approval_ci' <<<"$info")
+        case "$ci" in
+          none) did "$key" "no checks yet, not approved"; continue ;;
+          pending) did "$key" "CI pending, not approved yet"; continue ;;
+          failing:*) did "$key" "CI failing (${ci#failing: }), not approved"; continue ;;
+        esac
+      fi
+      if [ "$1" = "1" ]; then
+        did "$key" "(dry-run) would approve (by $author · $title)"
+      elif ghq api -X POST "repos/$repo/pulls/$num/reviews" -f event=APPROVE -f commit_id="$oid" >/dev/null; then
+        did "$key" "approved as $SESSION_LOGIN (by $author · $title)"
+      else
+        err=$(gh_err)
+        if reason=$(transient_reason "$err"); then
+          did "$key" "$reason, not approved, will retry next run"
+        else
+          did "$key" "not approved: ${err:-no details from gh}"
+        fi
+      fi
+    done <<<"$found_prs"
+  done
 }
 
 # Logs what the run did to the PR and keeps it for list. Uses cmd_run's actions.
@@ -702,6 +832,7 @@ cmd_run() {
           elif ($skip != "" and ([.labels[].name] | index($skip))) then "\(.repository.nameWithOwner)#\(.number)\tlabel \($skip), left alone"
           else empty end' <<<"$found")
   [ -n "$skipped" ] && while IFS=$'\t' read -r skipped_key skipped_why; do did "$skipped_key" "$skipped_why"; done <<<"$skipped"
+  auto_approve "$dry_run"
 
   if [ -z "$prs" ]; then
     # The state is not wiped: with the wrong account the search comes back empty, and switching
@@ -828,18 +959,16 @@ cmd_list() {
       else
         info='{}'
       fi
-      rows=$(jq --arg repo "$repo" --argjson num "$num" --arg behind "$behind" --argjson last "$last" --argjson info "$info" '
+      rows=$(jq --arg repo "$repo" --argjson num "$num" --arg behind "$behind" --argjson last "$last" --argjson info "$info" "$CHECKS_JQ"'
         ($info.statusCheckRollup // []) as $checks
-        | ([$checks[] | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"))
-            | .name // .context] | unique) as $failed
+        | ($checks | failed_checks) as $failed
         | . + [{
             repo: $repo, number: $num, title: ($info.title // ""), url: ($info.url // "https://github.com/\($repo)/pull/\($num)"),
             mergeable: ($info.mergeable // null),
             behind: (if $behind == "" then null else ($behind | tonumber) end),
             ci: (if ($checks | length) == 0 then null
                  elif ($failed | length) > 0 then "failing"
-                 elif any($checks[]; (.__typename == "CheckRun" and .status != "COMPLETED")
-                          or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED"))) then "pending"
+                 elif any($checks[]; pending_check) then "pending"
                  else "passing" end),
             failed_checks: $failed,
             review: (if ($info.reviewDecision // "") == "" then null else $info.reviewDecision end),
@@ -928,9 +1057,9 @@ list_pr_repos() {
       | select(. as $repo | $owners == "" or ($owners | split(" ") | index($repo | split("/")[0])))' | sort -u
 }
 
-# Every owner and repo in the config must exist and be visible to the account.
+# Every owner, repo and auto-approved author in the config must exist and be visible to the account.
 check_targets() {
-  local o r err
+  local o r a err
   for o in $OWNERS; do
     ghq api "users/$o" --jq .login >/dev/null && continue
     err=$(gh_err)
@@ -944,6 +1073,13 @@ check_targets() {
     retry_if_transient "$err"
     case "$err" in *"HTTP 404"*) die "repo '$r' does not exist or your account has no access to it" ;; esac
     die "could not verify '$r': $err"
+  done
+  for a in $AUTO_APPROVE_AUTHORS; do
+    ghq api "users/$a" --jq .login >/dev/null && continue
+    err=$(gh_err)
+    retry_if_transient "$err"
+    case "$err" in *"HTTP 404"*) die "user '$a' in AUTO_APPROVE_AUTHORS does not exist on GitHub" ;; esac
+    die "could not verify '$a': $err"
   done
 }
 
@@ -1024,6 +1160,8 @@ cmd_detect() {
     --arg GH_USER "$cfg_user" --arg OWNERS "$OWNERS" --arg REPOS "$REPOS" \
     --arg EVERY_MINUTES "$EVERY_MINUTES" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
     --arg NOTIFY_CHANGES_REQUESTED "$NOTIFY_CHANGES_REQUESTED" --arg NOTIFY_CI_FAILED "$NOTIFY_CI_FAILED" \
+    --arg AUTO_APPROVE_AUTHORS "$AUTO_APPROVE_AUTHORS" --arg AUTO_APPROVE_UNTIL "$AUTO_APPROVE_UNTIL" \
+    --arg AUTO_APPROVE_REQUIRE_CI "$AUTO_APPROVE_REQUIRE_CI" \
     --arg label "$LABEL" --arg plist "$PLIST" --argjson loaded "$loaded" --argjson plist_exists "$plist_exists" \
     --argjson others "$(other_agents | lines_json)" \
     --argjson errors "$(printf '%s' "$errors" | jq -s .)" \
@@ -1048,7 +1186,9 @@ cmd_detect() {
                  EVERY_MINUTES: ($EVERY_MINUTES | tonumber? // $EVERY_MINUTES),
                  INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL,
                  NOTIFY_CHANGES_REQUESTED: ($NOTIFY_CHANGES_REQUESTED == "true"),
-                 NOTIFY_CI_FAILED: ($NOTIFY_CI_FAILED == "true")}
+                 NOTIFY_CI_FAILED: ($NOTIFY_CI_FAILED == "true"),
+                 AUTO_APPROVE_AUTHORS: $AUTO_APPROVE_AUTHORS, AUTO_APPROVE_UNTIL: $AUTO_APPROVE_UNTIL,
+                 AUTO_APPROVE_REQUIRE_CI: ($AUTO_APPROVE_REQUIRE_CI == "true")}
       },
       installed: {label: $label, plist: $plist, plist_exists: $plist_exists, agent_loaded: $loaded},
       last_run_error: (if $last_error == "" then null else $last_error end),
@@ -1420,11 +1560,12 @@ cmd_install() {
   local yes=0 dry_run=0 flags=0
   local f_user="" f_owners="" f_repos="" f_every="" f_drafts="" f_skip="" f_image="" f_changes="" f_ci=""
   local set_user=0 set_owners=0 set_repos=0 set_every=0 set_drafts=0 set_skip=0 set_image=0 set_changes=0 set_ci=0
+  local f_approve="" f_until="" f_approve_ci="" set_approve=0 set_until=0 set_approve_ci=0 days
   while [ $# -gt 0 ]; do
     local opt="$1" val=""
     case "$opt" in
       --*=*) val="${opt#*=}"; opt="${opt%%=*}" ;;
-      --user|--owners|--repos|--every|--every-hours|--skip-label|--notify-image)
+      --user|--owners|--repos|--every|--every-hours|--skip-label|--notify-image|--auto-approve|--auto-approve-for|--auto-approve-until)
         [ $# -ge 2 ] || die "$opt needs a value"
         val="$2"; shift ;;
     esac
@@ -1447,11 +1588,28 @@ cmd_install() {
       --no-notify-changes-requested) f_changes=false; set_changes=1 ;;
       --notify-ci-failed) f_ci=true; set_ci=1 ;;
       --no-notify-ci-failed) f_ci=false; set_ci=1 ;;
+      --auto-approve) f_approve="$val"; set_approve=1 ;;
+      --no-auto-approve) f_approve=""; set_approve=1 ;;
+      --auto-approve-for) set_until=1
+        case "$val" in
+          forever) f_until="" ;;
+          *[!0-9dw]*|d|w|"") die "--auto-approve-for must be 1w, <N>d or forever (got '$val')" ;;
+          *w) [[ "${val%w}" =~ ^[0-9]+$ ]] || die "--auto-approve-for must be 1w, <N>d or forever (got '$val')"
+              days=$((10#${val%w} * 7)); f_until=$(date_plus_days "$days") ;;
+          *d) [[ "${val%d}" =~ ^[0-9]+$ ]] || die "--auto-approve-for must be 1w, <N>d or forever (got '$val')"
+              days=$((10#${val%d})); f_until=$(date_plus_days "$days") ;;
+          *) die "--auto-approve-for must be 1w, <N>d or forever (got '$val')" ;;
+        esac ;;
+      --auto-approve-until) f_until="$val"; set_until=1
+        valid_date "$val" || die "--auto-approve-until must be a date as YYYY-MM-DD (got '$val')" ;;
+      --auto-approve-require-ci) f_approve_ci=true; set_approve_ci=1 ;;
+      --no-auto-approve-require-ci) f_approve_ci=false; set_approve_ci=1 ;;
       *) die "unknown option for install: $opt" ;;
     esac
     shift
   done
-  flags=$((set_user + set_owners + set_repos + set_every + set_drafts + set_skip + set_image + set_changes + set_ci))
+  flags=$((set_user + set_owners + set_repos + set_every + set_drafts + set_skip + set_image + set_changes + set_ci
+    + set_approve + set_until + set_approve_ci))
 
   require_jq
   require_gh
@@ -1467,6 +1625,12 @@ cmd_install() {
   [ "$set_image" = "1" ] && NOTIFY_IMAGE="$f_image"
   [ "$set_changes" = "1" ] && NOTIFY_CHANGES_REQUESTED="$f_changes"
   [ "$set_ci" = "1" ] && NOTIFY_CI_FAILED="$f_ci"
+  [ "$set_approve" = "1" ] && AUTO_APPROVE_AUTHORS="$f_approve"
+  [ "$set_until" = "1" ] && AUTO_APPROVE_UNTIL="$f_until"
+  [ "$set_approve_ci" = "1" ] && AUTO_APPROVE_REQUIRE_CI="$f_approve_ci"
+  if [ -n "$f_approve" ] && [ "$set_until" = "0" ] && [ -z "$AUTO_APPROVE_UNTIL" ]; then
+    AUTO_APPROVE_UNTIL=$(date_plus_days 7)
+  fi
 
   # With no terminal (an agent, a script) or with flags, nothing is asked.
   local interactive=1
@@ -1644,6 +1808,8 @@ cmd_status() {
       --arg EVERY_MINUTES "$EVERY_MINUTES" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
       --arg NOTIFY_CHANGES_REQUESTED "$NOTIFY_CHANGES_REQUESTED" --argjson changes "$changes" \
       --arg NOTIFY_CI_FAILED "$NOTIFY_CI_FAILED" --argjson updates "$updates" \
+      --arg AUTO_APPROVE_AUTHORS "$AUTO_APPROVE_AUTHORS" --arg AUTO_APPROVE_UNTIL "$AUTO_APPROVE_UNTIL" \
+      --arg AUTO_APPROVE_REQUIRE_CI "$AUTO_APPROVE_REQUIRE_CI" \
       --argjson loaded "$loaded" --arg slots "$(schedule_slots)" --argjson state "$state" \
       --argjson log "$(tail -20 "$LOG" 2>/dev/null | lines_json)" \
       --arg last_error "$(cat "$LAST_ERROR" 2>/dev/null)" --arg last_run "$(cat "$LAST_RUN" 2>/dev/null)" \
@@ -1653,7 +1819,9 @@ cmd_status() {
                           EVERY_MINUTES: ($EVERY_MINUTES | tonumber? // $EVERY_MINUTES),
                           INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL,
                           NOTIFY_CHANGES_REQUESTED: ($NOTIFY_CHANGES_REQUESTED == "true"),
-                          NOTIFY_CI_FAILED: ($NOTIFY_CI_FAILED == "true")}},
+                          NOTIFY_CI_FAILED: ($NOTIFY_CI_FAILED == "true"),
+                          AUTO_APPROVE_AUTHORS: $AUTO_APPROVE_AUTHORS, AUTO_APPROVE_UNTIL: $AUTO_APPROVE_UNTIL,
+                          AUTO_APPROVE_REQUIRE_CI: ($AUTO_APPROVE_REQUIRE_CI == "true")}},
         agent_loaded: $loaded,
         schedule_minutes: ($slots | split(" ") | map(tonumber? // empty)),
         pr_state: $state,
@@ -1830,6 +1998,17 @@ cmd_doctor() {
       [ "$NOTIFY_CHANGES_REQUESTED" = "true" ] && notifies="$notifies, reviews that request changes"
       [ "$NOTIFY_CI_FAILED" = "true" ] && notifies="$notifies, CI failing after an update"
       check ok notifications "notifies: $notifies"
+      if [ -n "$AUTO_APPROVE_AUTHORS" ]; then
+        if auto_approve_expired; then
+          check warn auto_approve "auto-approve ended on $AUTO_APPROVE_UNTIL" \
+            "set AUTO_APPROVE_UNTIL in $CONFIG or run gh pr-watcher install --auto-approve-for 1w"
+        else
+          local ends="with no end date" ci_rule="without waiting for CI"
+          [ -n "$AUTO_APPROVE_UNTIL" ] && ends="until $AUTO_APPROVE_UNTIL"
+          [ "$AUTO_APPROVE_REQUIRE_CI" = "true" ] && ci_rule="once CI passes"
+          check ok auto_approve "auto-approves PRs by ${AUTO_APPROVE_AUTHORS// /, } $ends, $ci_rule"
+        fi
+      fi
       [ "$LEGACY_EVERY" = "1" ] && check warn config_legacy "the config still uses EVERY_HOURS, replaced by EVERY_MINUTES" \
         "gh pr-watcher install (rewrites the config and the schedule)"
     else
@@ -1850,7 +2029,10 @@ cmd_doctor() {
           local targets="${REPOS:-$OWNERS}"
           if [ -n "$targets" ]; then check ok targets "accessible: $targets"; else check ok targets "no filter: all your open PRs"; fi
         else
-          check fail targets "$PROBE_MSG" "fix OWNERS/REPOS; gh pr-watcher detect lists what your account can see"
+          case "$PROBE_MSG" in
+            *AUTO_APPROVE_AUTHORS*) check fail targets "$PROBE_MSG" "fix the login in AUTO_APPROVE_AUTHORS" ;;
+            *) check fail targets "$PROBE_MSG" "fix OWNERS/REPOS; gh pr-watcher detect lists what your account can see" ;;
+          esac
         fi
       fi
     else

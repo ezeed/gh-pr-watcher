@@ -24,7 +24,8 @@
 It does what GitHub's **"Update branch"** button does, but for you and on all your PRs at once.
 Nothing changes in the repo: no Actions, no bots, no new permissions. It never resolves conflicts,
 rebases or forces anything: when a PR conflicts, it only notifies you. It also tells you, once,
-when a review requests changes and, if you turn it on, when CI fails on a branch it updated.
+when a review requests changes and, if you turn it on, when CI fails on a branch it updated. If you
+ask for it, it also approves the PRs of the people you choose once their CI passes.
 
 Built for repos with the *"Require branches to be up to date before merging"* rule: every merge to
 the base leaves all open PRs behind, and each one has to be updated before it can merge.
@@ -95,10 +96,20 @@ reschedule.
 | `NOTIFY_IMAGE` | *(the logo)* | Local image (PNG or JPG) shown on the right of the notification. Only with `terminal-notifier`. The icon on the left can't be changed: macOS takes it from the notifying app. |
 | `NOTIFY_CHANGES_REQUESTED` | `true` | `true` = one notification when a review moves a PR to *changes requested*. It isn't repeated while the PR stays that way; if it's approved and changes get requested again, you're notified again. |
 | `NOTIFY_CI_FAILED` | `false` | `true` = one notification when CI fails on a branch the watcher updated. Only on its own merge commit: if you push in between or on top, it stops following it. It stops after 24 h without a result too. |
+| `AUTO_APPROVE_AUTHORS` | *(empty)* | GitHub logins, space-separated, whose open PRs in the watched orgs or repos get approved as your account. Empty = nothing is approved. |
+| `AUTO_APPROVE_UNTIL` | *(empty)* | Last day it approves, `YYYY-MM-DD`, inclusive. Empty = no end date. |
+| `AUTO_APPROVE_REQUIRE_CI` | `true` | `true` = approve only when the PR has checks and every one passed (success, neutral or skipped). Pending, failing or none: it tries again next run. |
 
 A misspelled key (`OWNER=`) or a line that isn't `KEY=VALUE` isn't silently ignored: you get a
 warning, with a suggestion if it looks like a real key. `install` also checks that every owner and
-repo exists and that your account can see it.
+repo exists and that your account can see it, and that every login in `AUTO_APPROVE_AUTHORS` exists.
+
+**Auto-approval approves code on your behalf.** Each run searches the open PRs of those logins in
+the same orgs or repos as your own (with neither set, in any repo) and approves the ones without a
+live approval of yours: not drafts, not PRs with `SKIP_LABEL`, never your own. A push that dismisses
+your approval, or a review where you requested changes, makes it approve again. That's why it waits
+for CI by default and why an end date is a good idea: `--auto-approve` without one gives it a week.
+Once it's past, it approves nothing and logs it once.
 
 The log and state live in `~/.local/state/gh-pr-watcher/`. While a PR stays conflicting, you
 get reminded at most once an hour (right away if a new one shows up or the list changes): a single notification for all of them, which opens the PR if there is one or a
@@ -142,6 +153,9 @@ existing config and anything missing comes from the defaults.
 | `--notify-image PATH` | Notification image (`NOTIFY_IMAGE`). `""` = the logo. |
 | `--notify-changes-requested` · `--no-notify-changes-requested` | Notify when a review requests changes or not (`NOTIFY_CHANGES_REQUESTED`). |
 | `--notify-ci-failed` · `--no-notify-ci-failed` | Notify when CI fails on a branch it updated or not (`NOTIFY_CI_FAILED`). |
+| `--auto-approve "a b"` · `--no-auto-approve` | Approve the PRs of these logins, or stop (`AUTO_APPROVE_AUTHORS`). |
+| `--auto-approve-for 1w\|<N>d\|forever` | Until when it approves (`AUTO_APPROVE_UNTIL`): `1w` = today + 7 days; `forever` = no end date. Without it and with no date in the config, `1w`. `--auto-approve-until YYYY-MM-DD` sets the date. |
+| `--auto-approve-require-ci` · `--no-auto-approve-require-ci` | Approve only once CI passed, or regardless (`AUTO_APPROVE_REQUIRE_CI`). |
 | `--yes` | Don't ask: use the existing config and the defaults. Useful to reschedule after editing the file. |
 | `--dry-run` | Shows the config and the LaunchAgent it would write, without touching anything. On its own, it still asks the questions. |
 
@@ -157,6 +171,7 @@ changes nothing and sends no notifications. It checks:
 - `gh` and `jq` installed, and `terminal-notifier` (as a warning only).
 - The config: misspelled keys and invalid values.
 - The `gh` session, the `repo` scope, and that each owner and repo exists and your account sees it.
+- Auto-approval, when it's on: whose PRs and until when, with a warning once the end date passed.
 - The schedule: that the LaunchAgent is loaded, that it points to a `gh` that still exists (brew
   sometimes moves it) and that its schedule matches `EVERY_MINUTES`.
 - **That it actually ran.** No notification covers this: if launchd stops firing, there's no error.
