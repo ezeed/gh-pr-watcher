@@ -3,7 +3,7 @@
 #
 # Each call maps to a key (non [A-Za-z0-9._-] characters become "_"):
 #   gh auth status ...          auth_status
-#   gh search prs ...           search_prs
+#   gh search prs ...           search_prs (search_prs_author_LOGIN with --author LOGIN other than @me)
 #   gh pr view N -R o/r ...     pr_view_o_r_N
 #   gh api [-X M] PATH ...      api_M_PATH (GET by default)
 # and is answered with the first file found among $key.<n>.json, $key.<n>.err, $key.json and
@@ -30,7 +30,12 @@ case "${1:-} ${2:-}" in
   "auth status")
     case " $* " in *" --help "*) echo "  --json fields   Output JSON with the specified fields"; exit 0 ;; esac
     key=auth_status ;;
-  "search prs") key=search_prs ;;
+  "search prs")
+    key=search_prs prev=""
+    for a in "$@"; do
+      [ "$prev" = --author ] && [ "$a" != @me ] && key="search_prs_author_$a"
+      prev="$a"
+    done ;;
   "pr view") key="pr_view_${repo}_${3:-}" ;;
   api\ *) key="api_${method}_$2" ;;
   *) echo "fake gh: unsupported call: $*" >&2; exit 2 ;;

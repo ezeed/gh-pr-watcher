@@ -36,8 +36,18 @@ fixture() { printf '%s\n' "$2" >"$FIXTURES/$(fixture_key "$1").json"; }
 fixture_err() { printf '%s\n' "$2" >"$FIXTURES/$(fixture_key "$1").err"; }
 
 # search_prs "o/r#N[ draft][ label:L]"...: the open PRs the search returns.
-search_prs() {
-  local spec items='[]'
+search_prs() { search_fixture search_prs "$@"; }
+
+# author_prs LOGIN "o/r#N[ draft][ label:L]"...: the open PRs the search for LOGIN's PRs returns.
+author_prs() {
+  local login="$1"
+  shift
+  search_fixture "search_prs_author_$login" "$@"
+}
+
+search_fixture() {
+  local key="$1" spec items='[]'
+  shift
   for spec in "$@"; do
     items=$(jq --arg s "$spec" '($s | split(" ")) as $w | ($w[0] | split("#")) as $k | . + [{
       repository: {nameWithOwner: $k[0]}, number: ($k[1] | tonumber),
@@ -45,7 +55,7 @@ search_prs() {
       labels: [$w[] | select(startswith("label:")) | {name: .[6:]}],
       title: "PR \($k[1])", url: "https://github.com/\($k[0])/pull/\($k[1])"}]' <<<"$items")
   done
-  fixture search_prs "$items"
+  fixture "$key" "$items"
 }
 
 # pr_view o/r#N MERGEABLE|CONFLICTING|UNKNOWN [call]: what gh pr view returns, on every call or
@@ -58,7 +68,7 @@ pr_view() {
     mergeable: $m, headRefOid: "head-\($n)", headRefName: "feat-\($n)",
     headRepositoryOwner: {login: "ana"}, baseRefName: "main",
     url: "https://github.com/\($r)/pull/\($n)", title: "PR \($n)", createdAt: (now - 7200 | todate),
-    reviewDecision: "", latestReviews: [], statusCheckRollup: []}')"
+    reviewDecision: "", latestReviews: [], reviews: [], statusCheckRollup: []}')"
 }
 
 # patch_view o/r#N CALL|"" JQ [jq args...]: edits what gh pr view returns, on every call or only
@@ -95,6 +105,26 @@ checks() {
     conclusion: (if .[1] == "IN_PROGRESS" then "" else .[1] end)}' | jq -s .)
   patch_view "$pr" "$call" '.statusCheckRollup = $r' --argjson r "$rollup"
 }
+
+# approvable o/r#N AUTHOR: AUTHOR's PR with passing checks, which GitHub accepts approving.
+approvable() {
+  local repo="${1%#*}" num="${1#*#}"
+  pr_view "$1" MERGEABLE
+  patch_view "$1" "" '.author = {login: $a}' --arg a "$2"
+  checks "$1" '' 'test:SUCCESS'
+  fixture "api_POST_repos/$repo/pulls/$num/reviews" '{"state": "APPROVED"}'
+}
+
+# my_reviews o/r#N STATE...: ana's reviews on the PR, oldest first, after one from another reviewer.
+my_reviews() {
+  local pr="$1"
+  shift
+  patch_view "$pr" "" '.reviews = [{author: {login: "carol"}, state: "APPROVED", submittedAt: "2026-01-01T00:00:00Z"}]
+    + ($s | to_entries | map({author: {login: "ana"}, state: .value,
+        submittedAt: "2026-01-0\(.key + 2)T00:00:00Z"}))' --argjson s "$(printf '%s\n' "$@" | jq -R . | jq -s .)"
+}
+
+today_plus() { date -v+"$1"d +%F 2>/dev/null || date -d "+$1 days" +%F; }
 
 # commit o/r SHA PARENT...: the commit, as gh api repos/o/r/commits/SHA returns it.
 commit() {
@@ -536,6 +566,243 @@ test_notify_ci_failed_config_and_flags() {
     == "notifies: conflicts, reviews that request changes, CI failing after an update"'
 }
 
+# ── run: auto-approval ─────────────────────────────────────────────────────────────────────────
+
+test_auto_approve_approves_a_ready_pr_of_an_author() {
+  config 'AUTO_APPROVE_AUTHORS=bob' 'OWNERS=acme'
+  search_prs
+  author_prs bob 'acme/api#5'
+  approvable 'acme/api#5' bob
+  watcher run
+  assert_rc 0
+  assert_has "$GH_CALLS" '^search prs --author bob --state open .* --owner acme$' 1
+  assert_has "$GH_CALLS" '^api -X POST repos/acme/api/pulls/5/reviews -f event=APPROVE -f commit_id=head-5$' 1
+  assert_log 'acme/api#5: approved as ana \(by bob · PR 5\)'
+  assert_json "$STATE_DIR/last_actions.json" '.prs["acme/api#5"] | startswith("approved as ana")'
+  assert_notified 0
+}
+
+test_auto_approve_skips_drafts_and_skip_label() {
+  config 'AUTO_APPROVE_AUTHORS=bob' INCLUDE_DRAFTS=true SKIP_LABEL=no-autoupdate
+  search_prs
+  author_prs bob 'acme/api#5 draft' 'acme/api#6 label:no-autoupdate'
+  approvable 'acme/api#5' bob
+  approvable 'acme/api#6' bob
+  watcher run
+  assert_rc 0
+  assert_lacks "$GH_CALLS" '^pr view '
+  assert_lacks "$GH_CALLS" '/reviews'
+  assert_log 'acme/api#5: draft by bob, not approved'
+  assert_log 'acme/api#6: label no-autoupdate, not approved'
+}
+
+test_auto_approve_skips_a_live_approval_and_approves_after_dismissal() {
+  config 'AUTO_APPROVE_AUTHORS=bob'
+  search_prs
+  author_prs bob 'acme/api#5' 'acme/api#6' 'acme/api#7'
+  approvable 'acme/api#5' bob
+  approvable 'acme/api#6' bob
+  approvable 'acme/api#7' bob
+  my_reviews 'acme/api#5' CHANGES_REQUESTED APPROVED COMMENTED
+  my_reviews 'acme/api#6' APPROVED DISMISSED
+  my_reviews 'acme/api#7' APPROVED CHANGES_REQUESTED
+  watcher run
+  assert_rc 0
+  assert_log 'acme/api#5: already approved by you'
+  assert_lacks "$GH_CALLS" 'pulls/5/reviews'
+  assert_has "$GH_CALLS" '^api -X POST repos/acme/api/pulls/6/reviews ' 1
+  assert_has "$GH_CALLS" '^api -X POST repos/acme/api/pulls/7/reviews ' 1
+}
+
+test_auto_approve_waits_for_ci() {
+  config 'AUTO_APPROVE_AUTHORS=bob'
+  search_prs
+  author_prs bob 'acme/api#5' 'acme/api#6' 'acme/api#7' 'acme/api#8' 'acme/api#9'
+  local n
+  for n in 5 6 7 8 9; do approvable "acme/api#$n" bob; done
+  checks 'acme/api#5' '' 'lint:SUCCESS' 'test:IN_PROGRESS'
+  checks 'acme/api#6' '' 'lint:SUCCESS' 'test:FAILURE'
+  patch_view 'acme/api#7' '' '.statusCheckRollup = []'
+  checks 'acme/api#8' '' 'lint:SUCCESS' 'test:CANCELLED'
+  checks 'acme/api#9' '' 'lint:SUCCESS' 'docs:SKIPPED' 'bench:NEUTRAL'
+  watcher run
+  assert_rc 0
+  assert_log 'acme/api#5: CI pending, not approved yet'
+  assert_log 'acme/api#6: CI failing \(test\), not approved'
+  assert_log 'acme/api#7: no checks yet, not approved'
+  assert_log 'acme/api#8: CI failing \(test\), not approved'
+  assert_lacks "$GH_CALLS" 'pulls/[5-8]/reviews'
+  assert_has "$GH_CALLS" '^api -X POST repos/acme/api/pulls/9/reviews ' 1
+}
+
+test_auto_approve_without_require_ci_ignores_checks() {
+  config 'AUTO_APPROVE_AUTHORS=bob' AUTO_APPROVE_REQUIRE_CI=false
+  search_prs
+  author_prs bob 'acme/api#5'
+  approvable 'acme/api#5' bob
+  checks 'acme/api#5' '' 'test:FAILURE'
+  watcher run
+  assert_rc 0
+  assert_has "$GH_CALLS" '^api -X POST repos/acme/api/pulls/5/reviews ' 1
+}
+
+test_auto_approve_never_approves_your_own_prs() {
+  config 'AUTO_APPROVE_AUTHORS=Ana bob'
+  search_prs
+  author_prs Ana 'acme/api#4'
+  author_prs bob 'acme/api#5'
+  approvable 'acme/api#4' ana
+  # A result of bob's search that turns out to be yours.
+  approvable 'acme/api#5' ana
+  watcher run
+  assert_rc 0
+  assert_lacks "$GH_CALLS" '--author Ana'
+  assert_lacks "$GH_CALLS" '/reviews'
+}
+
+test_auto_approve_expired_approves_nothing_and_logs_once() {
+  config 'AUTO_APPROVE_AUTHORS=bob' AUTO_APPROVE_UNTIL=2000-01-01
+  search_prs
+  author_prs bob 'acme/api#5'
+  approvable 'acme/api#5' bob
+  watcher run --dry-run
+  assert_no_file "$STATE_DIR/auto_approve_expired"
+  watcher run
+  watcher run
+  assert_rc 0
+  assert_lacks "$GH_CALLS" '--author bob'
+  assert_lacks "$GH_CALLS" '/reviews'
+  assert_log '^[0-9-]+ [0-9:]+ auto-approve expired on 2000-01-01$' 1
+  watcher doctor --json
+  assert_json "$SANDBOX/out" '.checks[] | select(.id == "auto_approve") | .status == "warn"
+    and .message == "auto-approve ended on 2000-01-01" and (.fix | test("--auto-approve-for 1w"))'
+}
+
+test_auto_approve_dry_run_approves_nothing() {
+  config 'AUTO_APPROVE_AUTHORS=bob'
+  search_prs
+  author_prs bob 'acme/api#5'
+  approvable 'acme/api#5' bob
+  watcher run --dry-run
+  assert_rc 0
+  assert_lacks "$GH_CALLS" '/reviews'
+  assert_log 'acme/api#5: \(dry-run\) would approve \(by bob · PR 5\)'
+  assert_no_file "$STATE_DIR/last_actions.json"
+}
+
+test_auto_approve_is_off_without_authors() {
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 0
+  watcher run
+  assert_rc 0
+  assert_has "$GH_CALLS" '^search prs ' 1
+  assert_lacks "$GH_CALLS" '/reviews'
+  watcher doctor --json
+  assert_json "$SANDBOX/out" 'all(.checks[]; .id != "auto_approve")'
+}
+
+test_auto_approve_failure_is_retried_next_run() {
+  config 'AUTO_APPROVE_AUTHORS=bob'
+  search_prs
+  author_prs bob 'acme/api#5' 'acme/api#6'
+  approvable 'acme/api#5' bob
+  approvable 'acme/api#6' bob
+  fixture_err api_POST_repos/acme/api/pulls/5/reviews.1 'HTTP 502: Bad Gateway'
+  fixture_err api_POST_repos/acme/api/pulls/6/reviews.1 'HTTP 422: Unprocessable Entity'
+  watcher run
+  assert_rc 0
+  assert_log 'acme/api#5: GitHub is failing, not approved, will retry next run'
+  assert_log 'acme/api#6: not approved: HTTP 422'
+  assert_no_file "$STATE_DIR/last_error"
+  assert_notified 0
+  watcher run
+  assert_log 'acme/api#5: approved as ana'
+}
+
+test_auto_approve_search_hiccup_leaves_the_rest_of_the_run() {
+  config 'AUTO_APPROVE_AUTHORS=bob carol'
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 3
+  fixture_err search_prs_author_bob 'HTTP 429: rate limit exceeded'
+  author_prs carol 'acme/api#5'
+  approvable 'acme/api#5' carol
+  watcher run
+  assert_rc 0
+  assert_log 'GitHub rate limit hit, skipping the PRs by bob this run'
+  assert_has "$GH_CALLS" '^api -X POST repos/acme/api/pulls/5/reviews ' 1
+  assert_has "$GH_CALLS" 'pulls/7/update-branch' 1
+  assert_no_file "$STATE_DIR/last_error"
+
+  fixture_err search_prs_author_bob 'HTTP 422: Validation Failed'
+  watcher run
+  assert_rc 1
+  assert_log 'the search for PRs by bob on GitHub failed: HTTP 422'
+  assert_file "$STATE_DIR/last_error"
+}
+
+test_auto_approve_config_and_flags() {
+  fixture api_GET_users/bob '{"login": "bob"}'
+  fixture api_GET_users/carol '{"login": "carol"}'
+  watcher install --dry-run --auto-approve 'bob carol' --auto-approve-for 1w
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^AUTO_APPROVE_AUTHORS=bob carol$' 1
+  assert_has "$SANDBOX/out" "^AUTO_APPROVE_UNTIL=$(today_plus 7)\$" 1
+  assert_has "$SANDBOX/out" '^AUTO_APPROVE_REQUIRE_CI=true$' 1
+  watcher install --dry-run --auto-approve bob
+  assert_has "$SANDBOX/out" "^AUTO_APPROVE_UNTIL=$(today_plus 7)\$" 1
+  watcher install --dry-run --auto-approve bob --auto-approve-for 3d --no-auto-approve-require-ci
+  assert_has "$SANDBOX/out" "^AUTO_APPROVE_UNTIL=$(today_plus 3)\$" 1
+  assert_has "$SANDBOX/out" '^AUTO_APPROVE_REQUIRE_CI=false$' 1
+  watcher install --dry-run --auto-approve bob --auto-approve-for forever
+  assert_has "$SANDBOX/out" '^AUTO_APPROVE_UNTIL=$' 1
+  watcher install --dry-run --auto-approve bob --auto-approve-until 2030-02-01
+  assert_has "$SANDBOX/out" '^AUTO_APPROVE_UNTIL=2030-02-01$' 1
+  config AUTO_APPROVE_UNTIL=2030-05-01
+  watcher install --dry-run --auto-approve bob
+  assert_has "$SANDBOX/out" '^AUTO_APPROVE_UNTIL=2030-05-01$' 1
+  config 'AUTO_APPROVE_AUTHORS=bob'
+  watcher install --dry-run --no-auto-approve
+  assert_has "$SANDBOX/out" '^AUTO_APPROVE_AUTHORS=$' 1
+
+  watcher install --dry-run --auto-approve ghost
+  assert_rc 1
+  assert_has "$SANDBOX/out" "error: user 'ghost' in AUTO_APPROVE_AUTHORS does not exist on GitHub" 1
+  watcher install --dry-run --auto-approve bob --auto-approve-for 2x
+  assert_rc 1
+  assert_has "$SANDBOX/out" "error: --auto-approve-for must be 1w, <N>d or forever \(got '2x'\)" 1
+
+  config 'AUTO_APPROVE_AUTHORS=bob,carol'
+  watcher run
+  assert_rc 1
+  assert_log 'AUTO_APPROVE_AUTHORS must be separated by spaces, not commas'
+  config AUTO_APPROVE_UNTIL=2026-13-01
+  watcher run
+  assert_rc 1
+  assert_log "AUTO_APPROVE_UNTIL must be a date as YYYY-MM-DD \(got '2026-13-01'\)"
+  config 'AUTO_APPROVE_UNTIL=next week'
+  watcher run
+  assert_rc 1
+  assert_log "AUTO_APPROVE_UNTIL must be a date as YYYY-MM-DD \(got 'next week'\)"
+  config AUTO_APPROVE_REQUIRE_CI=maybe
+  watcher run
+  assert_rc 1
+  assert_log 'AUTO_APPROVE_REQUIRE_CI must be true or false'
+
+  config 'AUTO_APPROVE_AUTHORS=bob carol' AUTO_APPROVE_UNTIL=2999-12-31
+  watcher doctor --json
+  assert_json "$SANDBOX/out" '.checks[] | select(.id == "auto_approve") | .status == "ok"
+    and .message == "auto-approves PRs by bob, carol until 2999-12-31, once CI passes"'
+  watcher status --json
+  assert_json "$SANDBOX/out" '.config.values | .AUTO_APPROVE_AUTHORS == "bob carol"
+    and .AUTO_APPROVE_UNTIL == "2999-12-31" and .AUTO_APPROVE_REQUIRE_CI == true'
+  watcher detect
+  assert_json "$SANDBOX/out" '.config.values.AUTO_APPROVE_AUTHORS == "bob carol"'
+  config 'AUTO_APPROVE_AUTHORS=ghost'
+  watcher doctor --json
+  assert_json "$SANDBOX/out" '.checks[] | select(.id == "targets") | .status == "fail"
+    and .fix == "fix the login in AUTO_APPROVE_AUTHORS"'
+}
+
 # ── run --dry-run ──────────────────────────────────────────────────────────────────────────────
 
 test_dry_run_changes_nothing() {
@@ -552,7 +819,7 @@ test_dry_run_changes_nothing() {
   assert_log '\(dry-run\) would notify: api#7 · changes requested'
   local f
   for f in state.json conflicts.json conflicts.html conflicts_reminded.json changes_requested.json \
-    changes_requested.html updates.json ci_failed.html last_actions.json last_run last_error; do
+    changes_requested.html updates.json ci_failed.html last_actions.json last_run last_error auto_approve_expired; do
     assert_no_file "$STATE_DIR/$f"
   done
 }
