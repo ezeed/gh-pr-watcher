@@ -45,6 +45,9 @@ author_prs() {
   search_fixture "search_prs_author_$login" "$@"
 }
 
+# assigned_prs "o/r#N[ draft][ label:L]"...: the open PRs the search for PRs assigned to you returns.
+assigned_prs() { search_fixture search_prs_assignee "$@"; }
+
 search_fixture() {
   local key="$1" spec items='[]'
   shift
@@ -353,6 +356,87 @@ test_search_uses_owners_or_repos() {
   watcher run
   assert_has "$GH_CALLS" '^search prs .* --repo acme/api --repo beta/web$' 1
   assert_lacks "$GH_CALLS" '^search prs .*--owner acme$'
+}
+
+# ── run: PRs assigned to you ──────────────────────────────────────────────────────────────────
+
+test_assigned_prs_are_ignored_by_default() {
+  config 'OWNERS=acme'
+  search_prs
+  assigned_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 3
+  watcher run
+  assert_rc 0
+  assert_lacks "$GH_CALLS" '--assignee'
+  assert_lacks "$GH_CALLS" '^pr view 7 '
+  assert_lacks "$GH_CALLS" 'update-branch'
+  assert_log 'no open PRs'
+}
+
+test_assigned_prs_are_updated_and_notified_with_watch_assigned() {
+  config 'OWNERS=acme' WATCH_ASSIGNED=true
+  search_prs
+  assigned_prs 'acme/api#7' 'acme/web#8'
+  pr 'acme/api#7' MERGEABLE 3
+  pr 'acme/web#8' CONFLICTING 2
+  watcher run
+  assert_rc 0
+  assert_has "$GH_CALLS" '^search prs --assignee @me --state open .* --owner acme$' 1
+  assert_has "$GH_CALLS" '^api -X PUT repos/acme/api/pulls/7/update-branch -f expected_head_sha=head-7$' 1
+  assert_log 'acme/api#7: 3 behind → branch updated from main'
+  assert_has "$NOTIFY_CALLS" '-subtitle web#8 · conflict needs attention .*-open https://github.com/acme/web/pull/8 ' 1
+  assert_json "$STATE_DIR/conflicts.json" 'length == 1 and .[0].key == "acme/web#8"'
+  watcher list --json
+  assert_json "$SANDBOX/out" 'map("\(.repo)#\(.number)") == ["acme/web#8", "acme/api#7"]'
+}
+
+test_a_pr_both_yours_and_assigned_is_processed_once() {
+  config WATCH_ASSIGNED=true SKIP_LABEL=no-autoupdate
+  search_prs 'acme/api#7' 'acme/api#9 label:no-autoupdate'
+  assigned_prs 'acme/api#7' 'acme/api#9 label:no-autoupdate'
+  pr 'acme/api#7' MERGEABLE 3
+  watcher run
+  assert_rc 0
+  assert_has "$GH_CALLS" '^pr view 7 -R acme/api ' 1
+  assert_has "$GH_CALLS" 'pulls/7/update-branch' 1
+  assert_log 'acme/api#7: ' 1
+  assert_log 'acme/api#9: label no-autoupdate, left alone' 1
+  watcher list --json
+  assert_json "$SANDBOX/out" 'map(.number) == [7]'
+}
+
+test_watch_assigned_search_failure_stops_the_run() {
+  config WATCH_ASSIGNED=true
+  search_prs 'acme/api#7'
+  pr 'acme/api#7' MERGEABLE 3
+  fixture_err search_prs_assignee 'HTTP 422: Validation Failed (https://api.github.com/search/issues)'
+  watcher run
+  assert_rc 1
+  assert_lacks "$GH_CALLS" 'update-branch'
+  assert_log 'the search for PRs assigned to you on GitHub failed: HTTP 422'
+}
+
+test_watch_assigned_config_and_flags() {
+  watcher install --dry-run --watch-assigned
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^WATCH_ASSIGNED=true$' 1
+  config WATCH_ASSIGNED=true
+  watcher install --dry-run --no-watch-assigned
+  assert_has "$SANDBOX/out" '^WATCH_ASSIGNED=false$' 1
+  config WATCH_ASSIGNED=yes
+  watcher run
+  assert_rc 1
+  assert_log 'WATCH_ASSIGNED must be true or false'
+  config WATCH_ASSIGNED=true
+  watcher status --json
+  assert_json "$SANDBOX/out" '.config.values.WATCH_ASSIGNED == true'
+  fixture auth_token 'gho_fake'
+  search_prs 'acme/api#7'
+  assigned_prs 'beta/web#3'
+  watcher detect
+  assert_json "$SANDBOX/out" '.config.values.WATCH_ASSIGNED == true'
+  assert_json "$SANDBOX/out" '.repos_with_prs == ["acme/api", "beta/web"]'
+  assert_has "$GH_CALLS" '^search prs --assignee @me --state open --limit 100 --json repository$' 1
 }
 
 # ── run: reviews that request changes ──────────────────────────────────────────────────────────

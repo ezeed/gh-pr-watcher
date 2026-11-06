@@ -92,6 +92,7 @@ para reprogramar.
 | `REPOS` | *(vacío)* | Repos puntuales `owner/repo`, separados por espacio. Si hay alguno, se vigilan **solo esos** y `OWNERS` no cuenta (la búsqueda de GitHub combina org y repo con Y, no con O). |
 | `EVERY_MINUTES` | `60` | Cada cuántos minutos corre: `15`, `30`, `60`, `120` o `180`, contando desde las 0 hs (`180` = 0, 3, 6… hs). Si la máquina está dormida a esa hora, launchd corre la vuelta al despertar. Cada actualización dispara el CI, así que un intervalo más corto puede sumar corridas de CI cuando entran varios merges seguidos. Una config con el viejo `EVERY_HOURS` sigue andando hasta el próximo `install`. |
 | `INCLUDE_DRAFTS` | `false` | `true` = también actualiza los drafts. |
+| `WATCH_ASSIGNED` | `false` | `true` = también vigila los PRs abiertos que tenés asignados, no solo los que abriste vos, en las mismas orgs o repos y con los mismos filtros. Reciben el mismo trato que los tuyos: actualizaciones, notificaciones y `list`. Un PR tuyo que además tenés asignado cuenta una sola vez. |
 | `SKIP_LABEL` | *(vacío)* | Los PRs con esta etiqueta no se tocan. El instalador ofrece `no-autoupdate`; en el archivo podés poner cualquiera. |
 | `NOTIFY_IMAGE` | *(el logo)* | Imagen local (PNG o JPG) que va a la derecha de la notificación. Solo con `terminal-notifier`. El ícono de la izquierda no se puede cambiar: macOS lo toma de la app que notifica. |
 | `NOTIFY_CHANGES_REQUESTED` | `true` | `true` = una notificación cuando un review deja un PR en *changes requested*. No se repite mientras siga así; si lo aprueban y vuelven a pedir cambios, avisa de nuevo. |
@@ -149,6 +150,7 @@ pisan la config que ya tenías y lo que falte sale de los defaults.
 | `--repos "o/r o/r"` | Solo estos repos (`REPOS`); reemplaza a `--owners`. |
 | `--every 15m\|30m\|1h\|2h\|3h` | Cada cuánto corre (`EVERY_MINUTES`). `--every-hours 1\|2\|3` sigue andando. |
 | `--drafts` · `--no-drafts` | Actualiza o no los drafts (`INCLUDE_DRAFTS`). |
+| `--watch-assigned` · `--no-watch-assigned` | Vigila o no también los PRs que tenés asignados (`WATCH_ASSIGNED`). |
 | `--skip-label L` · `--no-skip-label` | Excluye o no los PRs con la etiqueta L (`SKIP_LABEL`). |
 | `--notify-image PATH` | Imagen de las notificaciones (`NOTIFY_IMAGE`). `""` = el logo. |
 | `--notify-changes-requested` · `--no-notify-changes-requested` | Avisa o no cuando un review pide cambios (`NOTIFY_CHANGES_REQUESTED`). |

@@ -29,7 +29,7 @@ LOG_MAX_LINES=2000
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_IMAGE="$SELF_DIR/assets/icon.png"
 
-CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_MINUTES INCLUDE_DRAFTS SKIP_LABEL NOTIFY_IMAGE NOTIFY_CHANGES_REQUESTED NOTIFY_CI_FAILED AUTO_APPROVE_AUTHORS AUTO_APPROVE_UNTIL AUTO_APPROVE_REQUIRE_CI"
+CONFIG_KEYS="GH_USER OWNERS REPOS EVERY_MINUTES INCLUDE_DRAFTS WATCH_ASSIGNED SKIP_LABEL NOTIFY_IMAGE NOTIFY_CHANGES_REQUESTED NOTIFY_CI_FAILED AUTO_APPROVE_AUTHORS AUTO_APPROVE_UNTIL AUTO_APPROVE_REQUIRE_CI"
 # Read from older configs and converted to EVERY_MINUTES; never written.
 LEGACY_KEYS="EVERY_HOURS"
 EVERY_OPTIONS="15 30 60 120 180"
@@ -46,6 +46,7 @@ EVERY_MINUTES="60"
 EVERY_HOURS=""
 LEGACY_EVERY=0
 INCLUDE_DRAFTS="false"
+WATCH_ASSIGNED="false"
 SKIP_LABEL=""
 NOTIFY_IMAGE=""
 NOTIFY_CHANGES_REQUESTED="true"
@@ -78,6 +79,8 @@ Commands:
     --every 15m|30m|1h|2h|3h
                             How often it runs, starting at 0:00.
     --drafts | --no-drafts  Update drafts or not.
+    --watch-assigned | --no-watch-assigned
+                            Also watch the PRs assigned to you (off by default).
     --skip-label L | --no-skip-label
                             Exclude PRs with label L.
     --notify-image PATH     Image attached to notifications ("" = the bundled one).
@@ -332,6 +335,9 @@ EVERY_MINUTES=$EVERY_MINUTES
 # true = also update drafts.
 INCLUDE_DRAFTS=$INCLUDE_DRAFTS
 
+# true = also watch the open PRs assigned to you, not just the ones you authored.
+WATCH_ASSIGNED=$WATCH_ASSIGNED
+
 # PRs with this label are left alone (e.g. no-autoupdate). Empty = none are excluded.
 SKIP_LABEL=$SKIP_LABEL
 
@@ -376,6 +382,7 @@ validate_config() {
     [[ "$rp" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "REPOS has an invalid repo: '$rp' (expected owner/repo)"
   done
   case "$INCLUDE_DRAFTS" in true|false) ;; *) die "INCLUDE_DRAFTS must be true or false (got '$INCLUDE_DRAFTS')" ;; esac
+  case "$WATCH_ASSIGNED" in true|false) ;; *) die "WATCH_ASSIGNED must be true or false (got '$WATCH_ASSIGNED')" ;; esac
   case "$NOTIFY_CHANGES_REQUESTED" in true|false) ;;
     *) die "NOTIFY_CHANGES_REQUESTED must be true or false (got '$NOTIFY_CHANGES_REQUESTED')" ;;
   esac
@@ -643,10 +650,10 @@ notify_conflicts() { # conflicts_json dry_run
   jq -n --argjson at "$now" --arg keys "$keys" '{at: $at, keys: $keys}' >"$REMINDED"
 }
 
-# The search a run makes, for your PRs or for AUTHOR's, in SEARCH_ARGS (a function can't return an
-# array, and gh_fail must run in the caller's shell to stop it).
-search_args() { # [author]
-  SEARCH_ARGS=(search prs --author "${1:-@me}" --state open --limit 100
+# The search a run makes, for your PRs or for AUTHOR's (or those assigned to LOGIN), in SEARCH_ARGS
+# (a function can't return an array, and gh_fail must run in the caller's shell to stop it).
+search_args() { # [login] [author|assignee]
+  SEARCH_ARGS=(search prs "--${2:-author}" "${1:-@me}" --state open --limit 100
     --json "repository,number,isDraft,labels,title,url")
   local o r
   # gh search ANDs --owner and --repo: when repos are chosen, orgs are not passed.
@@ -655,6 +662,20 @@ search_args() { # [author]
   else
     for o in $OWNERS; do SEARCH_ARGS+=(--owner "$o"); done
   fi
+}
+
+# The PRs a run looks at, in found: yours and, with WATCH_ASSIGNED, those assigned to you, once each.
+# Called without $(...) so gh_fail stops the caller.
+search_watched() {
+  local assigned
+  search_args
+  found=$(ghq "${SEARCH_ARGS[@]}") || gh_fail "the PR search on GitHub failed"
+  [ "$WATCH_ASSIGNED" = "true" ] || return 0
+  search_args @me assignee
+  assigned=$(ghq "${SEARCH_ARGS[@]}") || gh_fail "the search for PRs assigned to you on GitHub failed"
+  found=$(jq -s 'add | reduce .[] as $p ({seen: {}, prs: []};
+      "\($p.repository.nameWithOwner)#\($p.number)" as $k
+      | if .seen[$k] then . else .seen[$k] = true | .prs += [$p] end) | .prs' <<<"$found$assigned")
 }
 
 # "owner/repo number" for each PR of the search a run looks at: no drafts or skip label, per config.
@@ -820,8 +841,7 @@ cmd_run() {
   fi
 
   local found
-  search_args
-  found=$(ghq "${SEARCH_ARGS[@]}") || gh_fail "the PR search on GitHub failed"
+  search_watched
 
   local prs
   prs=$(watched_prs "$found")
@@ -942,8 +962,7 @@ cmd_list() {
   use_account
 
   local found prs repo num info behind last='{}' rows='[]'
-  search_args
-  found=$(ghq "${SEARCH_ARGS[@]}") || gh_fail "the PR search on GitHub failed"
+  search_watched
   prs=$(watched_prs "$found")
   if [ -s "$LAST_ACTIONS" ]; then
     last=$(jq -c '.prs // {} | if type == "object" then . else {} end' "$LAST_ACTIONS" 2>/dev/null) || last='{}'
@@ -1048,12 +1067,16 @@ list_orgs() {
   ghq api user/orgs --paginate --jq '.[].login'
 }
 
-# Repos with your PRs (open or among the 100 most recent), filtered by owners if any.
+# Repos with your PRs (open or among the 100 most recent; with WATCH_ASSIGNED, also the open ones
+# assigned to you), filtered by owners if any.
 list_pr_repos() {
-  local owners="$1" open recent
+  local owners="$1" open recent assigned='[]'
   open=$(ghq search prs --author @me --state open --limit 100 --json repository) || return 1
   recent=$(ghq search prs --author @me --limit 100 --json repository) || return 1
-  printf '%s\n%s\n' "$open" "$recent" | jq -r --arg owners "$owners" '.[].repository.nameWithOwner
+  if [ "$WATCH_ASSIGNED" = "true" ]; then
+    assigned=$(ghq search prs --assignee @me --state open --limit 100 --json repository) || return 1
+  fi
+  printf '%s\n%s\n%s\n' "$open" "$recent" "$assigned" | jq -r --arg owners "$owners" '.[].repository.nameWithOwner
       | select(. as $repo | $owners == "" or ($owners | split(" ") | index($repo | split("/")[0])))' | sort -u
 }
 
@@ -1159,6 +1182,7 @@ cmd_detect() {
     --arg config_path "$CONFIG" --argjson config_exists "$config_exists" \
     --arg GH_USER "$cfg_user" --arg OWNERS "$OWNERS" --arg REPOS "$REPOS" \
     --arg EVERY_MINUTES "$EVERY_MINUTES" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
+    --arg WATCH_ASSIGNED "$WATCH_ASSIGNED" \
     --arg NOTIFY_CHANGES_REQUESTED "$NOTIFY_CHANGES_REQUESTED" --arg NOTIFY_CI_FAILED "$NOTIFY_CI_FAILED" \
     --arg AUTO_APPROVE_AUTHORS "$AUTO_APPROVE_AUTHORS" --arg AUTO_APPROVE_UNTIL "$AUTO_APPROVE_UNTIL" \
     --arg AUTO_APPROVE_REQUIRE_CI "$AUTO_APPROVE_REQUIRE_CI" \
@@ -1184,7 +1208,8 @@ cmd_detect() {
         exists: $config_exists,
         values: {GH_USER: $GH_USER, OWNERS: $OWNERS, REPOS: $REPOS,
                  EVERY_MINUTES: ($EVERY_MINUTES | tonumber? // $EVERY_MINUTES),
-                 INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL,
+                 INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), WATCH_ASSIGNED: ($WATCH_ASSIGNED == "true"),
+                 SKIP_LABEL: $SKIP_LABEL,
                  NOTIFY_CHANGES_REQUESTED: ($NOTIFY_CHANGES_REQUESTED == "true"),
                  NOTIFY_CI_FAILED: ($NOTIFY_CI_FAILED == "true"),
                  AUTO_APPROVE_AUTHORS: $AUTO_APPROVE_AUTHORS, AUTO_APPROVE_UNTIL: $AUTO_APPROVE_UNTIL,
@@ -1560,6 +1585,7 @@ cmd_install() {
   local yes=0 dry_run=0 flags=0
   local f_user="" f_owners="" f_repos="" f_every="" f_drafts="" f_skip="" f_image="" f_changes="" f_ci=""
   local set_user=0 set_owners=0 set_repos=0 set_every=0 set_drafts=0 set_skip=0 set_image=0 set_changes=0 set_ci=0
+  local f_assigned="" set_assigned=0
   local f_approve="" f_until="" f_approve_ci="" set_approve=0 set_until=0 set_approve_ci=0 days
   while [ $# -gt 0 ]; do
     local opt="$1" val=""
@@ -1581,6 +1607,8 @@ cmd_install() {
         offered_every "$f_every" || die "--every-hours must be 1, 2 or 3; for less than an hour, --every 15m or 30m (got '$val')" ;;
       --drafts) f_drafts=true; set_drafts=1 ;;
       --no-drafts) f_drafts=false; set_drafts=1 ;;
+      --watch-assigned) f_assigned=true; set_assigned=1 ;;
+      --no-watch-assigned) f_assigned=false; set_assigned=1 ;;
       --skip-label) f_skip="$val"; set_skip=1 ;;
       --no-skip-label) f_skip=""; set_skip=1 ;;
       --notify-image) f_image="$val"; set_image=1 ;;
@@ -1609,7 +1637,7 @@ cmd_install() {
     shift
   done
   flags=$((set_user + set_owners + set_repos + set_every + set_drafts + set_skip + set_image + set_changes + set_ci
-    + set_approve + set_until + set_approve_ci))
+    + set_assigned + set_approve + set_until + set_approve_ci))
 
   require_jq
   require_gh
@@ -1621,6 +1649,7 @@ cmd_install() {
   [ "$set_repos" = "1" ] && REPOS="$f_repos"
   [ "$set_every" = "1" ] && { EVERY_MINUTES="$f_every"; LEGACY_EVERY=0; }
   [ "$set_drafts" = "1" ] && INCLUDE_DRAFTS="$f_drafts"
+  [ "$set_assigned" = "1" ] && WATCH_ASSIGNED="$f_assigned"
   [ "$set_skip" = "1" ] && SKIP_LABEL="$f_skip"
   [ "$set_image" = "1" ] && NOTIFY_IMAGE="$f_image"
   [ "$set_changes" = "1" ] && NOTIFY_CHANGES_REQUESTED="$f_changes"
@@ -1710,6 +1739,7 @@ cmd_install() {
     LEGACY_EVERY=0
     choose_one EVERY_MINUTES "How often?" "${every_items[@]}"
     ask_bool INCLUDE_DRAFTS "Update drafts too?"
+    ask_bool WATCH_ASSIGNED "Also watch the PRs assigned to you?"
     local use_skip_label=false
     [ -n "$SKIP_LABEL" ] && use_skip_label=true
     ask_bool use_skip_label "Exclude PRs labeled ${SKIP_LABEL:-no-autoupdate}?"
@@ -1806,6 +1836,7 @@ cmd_status() {
     jq -n --arg version "$VERSION" --arg config_path "$CONFIG" --argjson config_exists "$config_exists" \
       --arg GH_USER "$GH_USER" --arg OWNERS "$OWNERS" --arg REPOS "$REPOS" \
       --arg EVERY_MINUTES "$EVERY_MINUTES" --arg INCLUDE_DRAFTS "$INCLUDE_DRAFTS" --arg SKIP_LABEL "$SKIP_LABEL" \
+      --arg WATCH_ASSIGNED "$WATCH_ASSIGNED" \
       --arg NOTIFY_CHANGES_REQUESTED "$NOTIFY_CHANGES_REQUESTED" --argjson changes "$changes" \
       --arg NOTIFY_CI_FAILED "$NOTIFY_CI_FAILED" --argjson updates "$updates" \
       --arg AUTO_APPROVE_AUTHORS "$AUTO_APPROVE_AUTHORS" --arg AUTO_APPROVE_UNTIL "$AUTO_APPROVE_UNTIL" \
@@ -1817,7 +1848,8 @@ cmd_status() {
         config: {path: $config_path, exists: $config_exists,
                  values: {GH_USER: $GH_USER, OWNERS: $OWNERS, REPOS: $REPOS,
                           EVERY_MINUTES: ($EVERY_MINUTES | tonumber? // $EVERY_MINUTES),
-                          INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), SKIP_LABEL: $SKIP_LABEL,
+                          INCLUDE_DRAFTS: ($INCLUDE_DRAFTS == "true"), WATCH_ASSIGNED: ($WATCH_ASSIGNED == "true"),
+                          SKIP_LABEL: $SKIP_LABEL,
                           NOTIFY_CHANGES_REQUESTED: ($NOTIFY_CHANGES_REQUESTED == "true"),
                           NOTIFY_CI_FAILED: ($NOTIFY_CI_FAILED == "true"),
                           AUTO_APPROVE_AUTHORS: $AUTO_APPROVE_AUTHORS, AUTO_APPROVE_UNTIL: $AUTO_APPROVE_UNTIL,
