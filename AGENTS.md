@@ -7,8 +7,9 @@ asks nothing: it uses the existing config plus the defaults.
 
 ## What it does (so you can explain it)
 
-Each run searches the person's open PRs (`gh search prs --author @me`) in the configured orgs or
-repos and, for each one:
+Each run searches the person's open PRs (`gh search prs --author @me`; with `WATCH_ASSIGNED=true`,
+also the ones assigned to them, `--assignee @me`, counted once) in the configured orgs or repos and,
+for each one:
 
 | PR state | Action |
 |---|---|
@@ -101,7 +102,7 @@ It returns JSON like this:
   "repos_with_prs": ["AcmeCorp/api", "AcmeCorp/web", "ana/dotfiles"],
   "config": {"path": "...", "exists": false,
              "values": {"GH_USER": "", "OWNERS": "", "REPOS": "", "EVERY_MINUTES": 60,
-                        "INCLUDE_DRAFTS": false, "SKIP_LABEL": "",
+                        "INCLUDE_DRAFTS": false, "WATCH_ASSIGNED": false, "SKIP_LABEL": "",
                         "NOTIFY_CHANGES_REQUESTED": true, "NOTIFY_CI_FAILED": false,
                         "AUTO_APPROVE_AUTHORS": "", "AUTO_APPROVE_UNTIL": "",
                         "AUTO_APPROVE_REQUIRE_CI": true}},
@@ -112,7 +113,8 @@ It returns JSON like this:
 }
 ```
 
-- `repos_with_prs` are the repos where the account has PRs, open or among its 100 most recent.
+- `repos_with_prs` are the repos where the account has PRs, open or among its 100 most recent
+  (plus the ones with open PRs assigned to it, when the config has `WATCH_ASSIGNED=true`).
   They are the candidates to watch.
 - `config.values` is what the file holds. If `exists` is false, these are the defaults.
 - If `installed.agent_loaded` is true, it's already installed: `install` reschedules it without
@@ -166,6 +168,7 @@ gh pr-watcher install           --owners "AcmeCorp" --every 1h --no-drafts --no-
 | `--repos "o/r o/r"` | `REPOS` | Only those repos. **Replaces** `OWNERS` (GitHub search combines org and repo with AND). |
 | `--every 15m\|30m\|1h\|2h\|3h` | `EVERY_MINUTES` | Counting from 0:00. Default `1h`. |
 | `--drafts` / `--no-drafts` | `INCLUDE_DRAFTS` | |
+| `--watch-assigned` / `--no-watch-assigned` | `WATCH_ASSIGNED` | Also watch the PRs assigned to the person, same circuit as their own. Default off. |
 | `--skip-label L` / `--no-skip-label` | `SKIP_LABEL` | The convention is `no-autoupdate`. |
 | `--notify-image PATH` | `NOTIFY_IMAGE` | Image attached to notifications. `""` = the bundled one. |
 | `--notify-changes-requested` / `--no-notify-changes-requested` | `NOTIFY_CHANGES_REQUESTED` | Default on. |

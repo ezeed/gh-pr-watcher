@@ -92,6 +92,7 @@ reschedule.
 | `REPOS` | *(empty)* | Specific `owner/repo` repos, space-separated. If set, **only those** are watched and `OWNERS` is ignored (GitHub search combines org and repo with AND, not OR). |
 | `EVERY_MINUTES` | `60` | How often it runs, in minutes: `15`, `30`, `60`, `120` or `180`, counting from 0:00 (`180` = 0:00, 3:00, 6:00…). If the machine is asleep at that time, launchd runs it on wake. Each update triggers CI, so a shorter interval can mean more CI runs when several merges land close together. A config with the old `EVERY_HOURS` keeps working until the next `install`. |
 | `INCLUDE_DRAFTS` | `false` | `true` = drafts get updated too. |
+| `WATCH_ASSIGNED` | `false` | `true` = it also watches the open PRs assigned to you, not just the ones you authored, in the same orgs or repos and with the same filters. They get the same treatment as yours: updates, notifications and `list`. A PR that is both yours and assigned to you counts once. |
 | `SKIP_LABEL` | *(empty)* | PRs with this label are left alone. The installer offers `no-autoupdate`; in the file you can use any label. |
 | `NOTIFY_IMAGE` | *(the logo)* | Local image (PNG or JPG) shown on the right of the notification. Only with `terminal-notifier`. The icon on the left can't be changed: macOS takes it from the notifying app. |
 | `NOTIFY_CHANGES_REQUESTED` | `true` | `true` = one notification when a review moves a PR to *changes requested*. It isn't repeated while the PR stays that way; if it's approved and changes get requested again, you're notified again. |
@@ -149,6 +150,7 @@ existing config and anything missing comes from the defaults.
 | `--repos "o/r o/r"` | Only these repos (`REPOS`); replaces `--owners`. |
 | `--every 15m\|30m\|1h\|2h\|3h` | How often it runs (`EVERY_MINUTES`). `--every-hours 1\|2\|3` still works. |
 | `--drafts` · `--no-drafts` | Update drafts or not (`INCLUDE_DRAFTS`). |
+| `--watch-assigned` · `--no-watch-assigned` | Also watch the PRs assigned to you or not (`WATCH_ASSIGNED`). |
 | `--skip-label L` · `--no-skip-label` | Exclude PRs with label L or not (`SKIP_LABEL`). |
 | `--notify-image PATH` | Notification image (`NOTIFY_IMAGE`). `""` = the logo. |
 | `--notify-changes-requested` · `--no-notify-changes-requested` | Notify when a review requests changes or not (`NOTIFY_CHANGES_REQUESTED`). |
