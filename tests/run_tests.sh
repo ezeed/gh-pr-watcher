@@ -980,6 +980,87 @@ test_list_uses_the_same_filters_as_run() {
   assert_has "$SANDBOX/out" 'error: unknown option for list: --wide' 1
 }
 
+# ── approvals ──────────────────────────────────────────────────────────────────────────────────
+
+test_approvals_shows_what_the_next_run_will_do() {
+  config 'AUTO_APPROVE_AUTHORS=bob carol' 'OWNERS=acme' SKIP_LABEL=no-autoupdate
+  author_prs bob 'acme/api#5' 'acme/api#6' 'acme/api#7' 'acme/api#8 draft' 'acme/api#9 label:no-autoupdate'
+  author_prs carol 'acme/web#3'
+  approvable 'acme/api#5' bob
+  approvable 'acme/api#6' bob
+  checks 'acme/api#6' '' 'lint:SUCCESS' 'test:FAILURE'
+  approvable 'acme/api#7' bob
+  my_reviews 'acme/api#7' APPROVED
+  approvable 'acme/web#3' carol
+  checks 'acme/web#3' '' 'test:IN_PROGRESS'
+  watcher approvals
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^auto-approves, as ana, the PRs by bob, carol in acme · no end date · once CI passes$' 1
+  assert_has "$SANDBOX/out" '^last run: none yet$' 1
+  [ "$(awk '/^acme/ {printf "%s ", $2}' "$SANDBOX/out")" = "#5 #3 #6 #7 #8 #9 " ] \
+    || fail "rows out of order: $(awk '/^acme/ {printf "%s ", $2}' "$SANDBOX/out")"
+  assert_has "$SANDBOX/out" '^REPO +PR +AUTHOR +NEXT RUN +LAST RUN +AGE +TITLE$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#5 +bob +will approve +- +2h +PR 5$' 1
+  assert_has "$SANDBOX/out" '^acme/web +#3 +carol +waits for CI +' 1
+  assert_has "$SANDBOX/out" '^acme/api +#6 +bob +CI failing \(test\) +' 1
+  assert_has "$SANDBOX/out" '^acme/api +#7 +bob +already approved +' 1
+  assert_has "$SANDBOX/out" '^acme/api +#8 +bob +draft, skipped +' 1
+  assert_has "$SANDBOX/out" '^acme/api +#9 +bob +skip label +' 1
+  # It only reads.
+  assert_lacks "$GH_CALLS" '/reviews'
+  assert_lacks "$GH_CALLS" 'update-branch'
+  assert_notified 0
+  assert_no_file "$STATE_DIR/last_actions.json"
+  assert_no_file "$STATE_DIR/last_run"
+}
+
+test_approvals_shows_the_last_run_and_drops_merged_prs() {
+  config 'AUTO_APPROVE_AUTHORS=bob'
+  search_prs
+  author_prs bob 'acme/api#5' 'acme/api#6'
+  approvable 'acme/api#5' bob
+  approvable 'acme/api#6' bob
+  checks 'acme/api#6' '' 'test:IN_PROGRESS'
+  watcher run
+  # The approval the run left, and #5 merged since.
+  my_reviews 'acme/api#5' APPROVED
+  author_prs bob 'acme/api#6'
+  watcher approvals
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^last run: [0-9-]+ [0-9:]+$' 1
+  assert_has "$SANDBOX/out" '^acme/api +#6 +bob +waits for CI +CI pending, not approved yet +' 1
+  assert_lacks "$SANDBOX/out" '#5'
+}
+
+test_approvals_json() {
+  config 'AUTO_APPROVE_AUTHORS=bob ana' 'REPOS=acme/api' AUTO_APPROVE_UNTIL=2000-01-01
+  author_prs bob 'acme/api#5'
+  author_prs ana 'acme/api#9'
+  approvable 'acme/api#5' bob
+  watcher approvals --json
+  assert_rc 0
+  assert_json "$SANDBOX/out" '.enabled and .as == "ana" and .authors == ["bob", "ana"] and .repos == ["acme/api"]
+    and .until == "2000-01-01" and .expired and .require_ci and .last_run_at == null'
+  # Your own PRs never show; a ready one past the end date is not approved.
+  assert_json "$SANDBOX/out" '.prs | length == 1 and (.[0] | .repo == "acme/api" and .number == 5 and .author == "bob"
+    and .next_run == "expired" and .failed_checks == [] and .url == "https://github.com/acme/api/pull/5")'
+  assert_lacks "$GH_CALLS" 'search prs --author ana'
+}
+
+test_approvals_when_off_and_bad_options() {
+  watcher approvals
+  assert_rc 0
+  assert_has "$SANDBOX/out" '^auto-approve is off' 1
+  assert_lacks "$GH_CALLS" 'search prs'
+  watcher approvals --json
+  assert_json "$SANDBOX/out" '.enabled == false and .prs == []'
+  watcher approvals --wide
+  assert_rc 1
+  assert_has "$SANDBOX/out" 'error: unknown option for approvals: --wide' 1
+  watcher approvasl
+  assert_has "$SANDBOX/out" 'did you mean approvals' 1
+}
+
 # ── run: errors ────────────────────────────────────────────────────────────────────────────────
 
 test_transient_error_waits_silently() {

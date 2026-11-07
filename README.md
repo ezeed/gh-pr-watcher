@@ -126,6 +126,7 @@ and how many PRs are open); older ones are dropped on each run.
 | `install [options]` | Saves the config and schedules the run (launchd on macOS; on Linux it prints the `crontab` line). With a terminal and no options, it asks. |
 | `run [--dry-run]` | Runs once now. With `--dry-run` it reports what it would do, without updating branches, notifying or saving state. |
 | `list [--json]` | Your open PRs as a run sees them (same filters), the ones that need you first: conflict, changes requested, CI failing, behind, up to date. Shows state, CI, reviews, what the last run did, age and title. Changes nothing. `--json` gives one object per PR. |
+| `approvals [--json]` | Auto-approval right now: who it approves, in which orgs or repos, until when and whether CI is required, then each open PR by those authors with what the next run will do (approve, wait for CI, CI failing, already approved, draft, skip label) and what the last run did. Merged or closed PRs drop out: it asks GitHub each time and keeps nothing new. Changes nothing. `--json` gives the config plus one object per PR. |
 | `status [--json]` | Config, whether the agent is loaded, the last run, the last error and the tail of the log. |
 | `doctor [--json]` | Checks everything a run needs and says how to fix each problem. Changes nothing. |
 | `log [N]` | The last N log lines (30 by default). |
