@@ -103,6 +103,9 @@ Commands:
                           notifying or saving state.
   list [--json]           Your open PRs as a run sees them, the ones that need you first:
                           state, CI, reviews and what the last run did. Changes nothing.
+  approvals [--json]      Auto-approval at a glance: who, where and until when, each open PR
+                          by those authors with what the next run will do and what the last
+                          one did. Merged or closed PRs drop out. Changes nothing.
   test-notify             Sends a test notification.
   doctor [--json]         Checks dependencies, session, config, schedule and the last
                           run, with the fix for each problem. Changes nothing.
@@ -701,9 +704,28 @@ view_pr() { # repo num
   printf '%s' "$info"
 }
 
-APPROVE_FIELDS="headRefOid,author,reviews,statusCheckRollup,title"
+APPROVE_FIELDS="headRefOid,author,reviews,statusCheckRollup,title,url,createdAt"
 
 lower() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
+
+# What auto-approval makes of a PR read with APPROVE_FIELDS, as the lowercase login ME: own,
+# approved (ME's latest approval is still live), none, pending or "failing: <checks>" (with
+# AUTO_APPROVE_REQUIRE_CI), or ready. Shared by run and approvals so they never disagree.
+approval_verdict() { # info_json me
+  jq -r --arg me "$2" --argjson ci "$AUTO_APPROVE_REQUIRE_CI" "$CHECKS_JQ"'
+    if (.author.login // "" | ascii_downcase) == $me then "own"
+    elif ([.reviews[]? | select((.author.login // "" | ascii_downcase) == $me
+            and (.state | IN("APPROVED", "DISMISSED", "CHANGES_REQUESTED")))]
+          | sort_by(.submittedAt // "") | last | .state // "") == "APPROVED" then "approved"
+    elif $ci then ((.statusCheckRollup // []) | approval_ci | if . == "passing" then "ready" else . end)
+    else "ready" end' <<<"$1"
+}
+
+# "repo number draft|label|-" for each PR of a search for an author's PRs.
+author_prs_lines() { # search_json
+  jq -r --arg skip "$SKIP_LABEL" '.[] | "\(.repository.nameWithOwner) \(.number) "
+    + (if .isDraft then "draft" elif $skip != "" and ([.labels[].name] | index($skip)) then "label" else "-" end)' <<<"$1"
+}
 
 # Approves, as SESSION_LOGIN, the open PRs by AUTO_APPROVE_AUTHORS in the watched scope that don't
 # carry its live approval yet, and with AUTO_APPROVE_REQUIRE_CI only once every check passed.
@@ -719,7 +741,7 @@ auto_approve() { # dry_run
     fi
     return 0
   fi
-  local me author found found_prs repo num skip key info oid title last ci err reason
+  local me author found found_prs repo num skip key info oid title verdict err reason
   me=$(lower "$SESSION_LOGIN")
   for author in $AUTO_APPROVE_AUTHORS; do
     [ "$(lower "$author")" = "$me" ] && continue
@@ -732,8 +754,7 @@ auto_approve() { # dry_run
       fi
       die "the search for PRs by $author on GitHub failed: ${err:-no details from gh}"
     fi
-    found_prs=$(jq -r --arg skip "$SKIP_LABEL" '.[] | "\(.repository.nameWithOwner) \(.number) "
-      + (if .isDraft then "draft" elif $skip != "" and ([.labels[].name] | index($skip)) then "label" else "-" end)' <<<"$found")
+    found_prs=$(author_prs_lines "$found")
     [ -n "$found_prs" ] || continue
     while read -r repo num skip; do
       key="$repo#$num"
@@ -745,24 +766,16 @@ auto_approve() { # dry_run
         did "$key" "could not read the PR to approve it, will retry next run"
         continue
       fi
-      [ "$(jq -r '.author.login // "" | ascii_downcase' <<<"$info")" = "$me" ] && continue
       oid=$(jq -r .headRefOid <<<"$info")
       title=$(jq -r .title <<<"$info")
-      last=$(jq -r --arg me "$me" '[.reviews[]? | select((.author.login // "" | ascii_downcase) == $me
-          and (.state | IN("APPROVED", "DISMISSED", "CHANGES_REQUESTED")))]
-        | sort_by(.submittedAt // "") | last | .state // ""' <<<"$info")
-      if [ "$last" = "APPROVED" ]; then
-        did "$key" "already approved by you"
-        continue
-      fi
-      if [ "$AUTO_APPROVE_REQUIRE_CI" = "true" ]; then
-        ci=$(jq -r "$CHECKS_JQ"'(.statusCheckRollup // []) | approval_ci' <<<"$info")
-        case "$ci" in
-          none) did "$key" "no checks yet, not approved"; continue ;;
-          pending) did "$key" "CI pending, not approved yet"; continue ;;
-          failing:*) did "$key" "CI failing (${ci#failing: }), not approved"; continue ;;
-        esac
-      fi
+      verdict=$(approval_verdict "$info" "$me")
+      case "$verdict" in
+        own) continue ;;
+        approved) did "$key" "already approved by you"; continue ;;
+        none) did "$key" "no checks yet, not approved"; continue ;;
+        pending) did "$key" "CI pending, not approved yet"; continue ;;
+        failing:*) did "$key" "CI failing (${verdict#failing: }), not approved"; continue ;;
+      esac
       if [ "$1" = "1" ]; then
         did "$key" "(dry-run) would approve (by $author · $title)"
       elif ghq api -X POST "repos/$repo/pulls/$num/reviews" -f event=APPROVE -f commit_id="$oid" >/dev/null; then
@@ -1024,6 +1037,117 @@ cmd_list() {
            .title])
     | (transpose | map(map(length) | max)) as $w
     | .[] | [to_entries[] | .key as $i | if $i < 7 then (.value | pad($w[$i])) else .value end] | join("  ")' <<<"$rows"
+}
+
+# Auto-approval right now: who, where, until when, and each open PR by those authors with what the
+# next run will do and what the last run did. Merged or closed PRs drop out. Reads only.
+cmd_approvals() {
+  local json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      *) die "unknown option for approvals: $1" ;;
+    esac
+    shift
+  done
+  load_config
+  validate_config
+  require_jq
+  require_gh
+
+  if [ -z "$AUTO_APPROVE_AUTHORS" ]; then
+    if [ "$json" = "1" ]; then
+      jq -n '{enabled: false, authors: [], prs: []}'
+    else
+      echo "auto-approve is off (AUTO_APPROVE_AUTHORS is empty)"
+      echo "turn it on: gh pr-watcher install --auto-approve \"login1 login2\""
+    fi
+    return 0
+  fi
+  require_session
+  use_account
+
+  local me expired=false last='{}' last_at=null author found lines repo num skip info verdict rows='[]'
+  me=$(lower "$SESSION_LOGIN")
+  auto_approve_expired && expired=true
+  if [ -s "$LAST_ACTIONS" ]; then
+    last=$(jq -c '.prs // {} | if type == "object" then . else {} end' "$LAST_ACTIONS" 2>/dev/null) || last='{}'
+    last_at=$(jq -c '.at // null' "$LAST_ACTIONS" 2>/dev/null) || last_at=null
+  fi
+
+  for author in $AUTO_APPROVE_AUTHORS; do
+    [ "$(lower "$author")" = "$me" ] && continue
+    search_args "$author"
+    found=$(ghq "${SEARCH_ARGS[@]}") || die "the search for PRs by $author on GitHub failed: $(gh_err)"
+    lines=$(author_prs_lines "$found")
+    [ -n "$lines" ] || continue
+    while read -r repo num skip; do
+      info='{}'
+      case "$skip" in
+        draft) verdict=draft ;;
+        label) verdict=label ;;
+        *) if info=$(ghq pr view "$num" -R "$repo" --json "$APPROVE_FIELDS"); then
+             verdict=$(approval_verdict "$info" "$me")
+           else
+             info='{}' verdict=unreadable
+           fi ;;
+      esac
+      [ "$verdict" = "own" ] && continue
+      rows=$(jq --arg repo "$repo" --argjson num "$num" --arg author "$author" --arg v "$verdict" \
+        --argjson info "$info" --argjson found "$found" --argjson last "$last" --argjson expired "$expired" '
+        ($found[] | select(.repository.nameWithOwner == $repo and .number == $num)) as $p
+        | . + [{
+            repo: $repo, number: $num, author: $author,
+            title: ($info.title // $p.title // ""), url: ($info.url // $p.url // "https://github.com/\($repo)/pull/\($num)"),
+            next_run: (if $v == "ready" then (if $expired then "expired" else "approve" end)
+                       elif ($v | startswith("failing")) then "ci_failing" else $v end),
+            failed_checks: (if ($v | startswith("failing: ")) then ($v[9:] | split(", ")) else [] end),
+            last_run: ($last["\($repo)#\($num)"] // null),
+            created_at: ($info.createdAt // null)}]' <<<"$rows")
+    done <<<"$lines"
+  done
+
+  rows=$(jq 'sort_by({approve: 0, expired: 0, pending: 1, ci_failing: 2, none: 3, unreadable: 4,
+      approved: 5, draft: 6, label: 7}[.next_run] // 9, .repo, .number)' <<<"$rows")
+
+  if [ "$json" = "1" ]; then
+    jq -n --arg authors "$AUTO_APPROVE_AUTHORS" --arg owners "$OWNERS" --arg repos "$REPOS" \
+      --arg until "$AUTO_APPROVE_UNTIL" --argjson expired "$expired" --argjson ci "$AUTO_APPROVE_REQUIRE_CI" \
+      --arg login "$SESSION_LOGIN" --argjson at "$last_at" --argjson prs "$rows" '
+      def words: split(" ") | map(select(. != ""));
+      {enabled: true, as: $login, authors: ($authors | words), owners: ($owners | words), repos: ($repos | words),
+       until: (if $until == "" then null else $until end), expired: $expired, require_ci: $ci,
+       last_run_at: (if $at then ($at | todate) else null end), prs: $prs}'
+    return 0
+  fi
+
+  local scope ends ci_rule
+  if [ -n "$REPOS" ]; then scope="${REPOS// /, }"; elif [ -n "$OWNERS" ]; then scope="${OWNERS// /, }"; else scope="any repo"; fi
+  if [ "$expired" = "true" ]; then ends="ended on $AUTO_APPROVE_UNTIL, approving nothing"
+  elif [ -n "$AUTO_APPROVE_UNTIL" ]; then ends="until $AUTO_APPROVE_UNTIL"
+  else ends="no end date"; fi
+  if [ "$AUTO_APPROVE_REQUIRE_CI" = "true" ]; then ci_rule="once CI passes"; else ci_rule="CI not required"; fi
+  echo "auto-approves, as $SESSION_LOGIN, the PRs by ${AUTO_APPROVE_AUTHORS// /, } in $scope · $ends · $ci_rule"
+  if [ "$last_at" != "null" ]; then echo "last run: $(fmt_epoch "$last_at")"; else echo "last run: none yet"; fi
+  echo
+  if [ "$(jq length <<<"$rows")" = "0" ]; then
+    echo "no open PRs by ${AUTO_APPROVE_AUTHORS// /, }"
+  else
+    jq -r 'def pad($n): . + (" " * ($n - length) // "");
+      def age: (now - (fromdateiso8601? // now)) | floor
+        | if . < 3600 then "\(. / 60 | floor)m" elif . < 86400 then "\(. / 3600 | floor)h" else "\(. / 86400 | floor)d" end;
+      [["REPO", "PR", "AUTHOR", "NEXT RUN", "LAST RUN", "AGE", "TITLE"]]
+      + map([.repo, "#\(.number)", .author,
+             ({approve: "will approve", expired: "ready, but expired", pending: "waits for CI",
+               ci_failing: "CI failing (\(.failed_checks | join(", ")))", none: "waits for checks",
+               unreadable: "could not read it", approved: "already approved", draft: "draft, skipped",
+               label: "skip label"}[.next_run] // .next_run),
+             (.last_run // "-"),
+             (if .created_at then (.created_at | age) else "-" end),
+             .title])
+      | (transpose | map(map(length) | max)) as $w
+      | .[] | [to_entries[] | .key as $i | if $i < 6 then (.value | pad($w[$i])) else .value end] | join("  ")' <<<"$rows"
+  fi
 }
 
 # A real run that finished fine clears the last error (without notifying: it only logs it).
@@ -2138,7 +2262,7 @@ cmd_doctor() {
 # A one-letter typo (rub, stauts) or a prefix (inst) suggests the real command.
 suggest_command() {
   local typed="$1" c i diff
-  for c in run list install uninstall status detect doctor config log test-notify version help; do
+  for c in run list approvals install uninstall status detect doctor config log test-notify version help; do
     if [[ "$c" == "$typed"* ]] && [ ${#typed} -ge 2 ]; then printf ' (did you mean %s?)' "$c"; return 0; fi
     [ ${#c} -eq ${#typed} ] || continue
     diff=0
@@ -2159,6 +2283,7 @@ main() {
   case "$cmd" in
     run) cmd_run "$@" ;;
     list|ls) cmd_list "$@" ;;
+    approvals) cmd_approvals "$@" ;;
     install) cmd_install "$@" ;;
     uninstall) cmd_uninstall ;;
     status) cmd_status "$@" ;;

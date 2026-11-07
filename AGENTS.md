@@ -199,6 +199,11 @@ Right after installing, the `last_run` check says `not due to run yet (next: …
 `list --json` neither: it gives, per PR, `state` (`conflict`, `behind`, `up_to_date`, `unknown`),
 `behind`, `ci` (`failing`, `pending`, `passing` or null), `failed_checks`, `review`, `last_run` (what
 the last run did to it) and `created_at`, with the ones that need the person first.
+`approvals --json` neither: it gives the auto-approval config (`enabled`, `as`, `authors`, `owners`,
+`repos`, `until`, `expired`, `require_ci`, `last_run_at`) and, per open PR by those authors, `next_run`
+(`approve`, `expired`, `pending`, `ci_failing`, `none`, `unreadable`, `approved`, `draft`, `label`),
+`failed_checks`, `last_run` and `created_at`. Merged PRs drop out: use it to answer "what is it
+approving?".
 `test-notify` does send a notification (to check that macOS shows them): ask first.
 
 ## Errors
